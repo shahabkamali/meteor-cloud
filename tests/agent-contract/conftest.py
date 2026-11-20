@@ -7,7 +7,7 @@ AGENT_CONTRACT_MODE:
 AGENT_CONTRACT_AGENT: which adapter drives the agent: ``python`` (default) or ``go``.
 
 A scenario marked ``@pytest.mark.requires("feature", ...)`` is skipped for an adapter whose
-``features`` lack one of them (the Go agent gains MQTT, actions, Wi-Fi, WireGuard and deploys
+``features`` lack one of them (the Go agent gains MQTT, actions, Wi-Fi and WireGuard
 in later pull requests).
 """
 

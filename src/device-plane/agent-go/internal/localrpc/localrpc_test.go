@@ -358,3 +358,29 @@ func TestLongHandlerTimeoutAndRetryAfter(t *testing.T) {
 		t.Errorf("busy = %#v", err)
 	}
 }
+
+func TestCallEndsWhenContextIsCancelled(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	path := serve(t, &Server{
+		Authorize: func(Peer, string) error { return nil },
+		Log:       slog.New(slog.DiscardHandler),
+		Handlers: map[string]Handler{"slow": {Timeout: time.Minute, Run: func(ctx context.Context, _ Peer, _ json.RawMessage) (any, error) {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil, nil
+		}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	time.AfterFunc(100*time.Millisecond, cancel)
+	start := time.Now()
+	err := Call(ctx, path, "slow", nil, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("call returned %s after cancel", took)
+	}
+}

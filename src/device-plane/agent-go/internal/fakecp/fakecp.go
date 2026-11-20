@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// Reply is one scripted answer.
+// Reply is one scripted answer. A []byte Body is sent as is, anything else as JSON.
 type Reply struct {
 	Status int
 	Body   any
@@ -129,6 +129,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 
 	for k, v := range reply.Header {
 		w.Header().Set(k, v)
+	}
+	if raw, ok := reply.Body.([]byte); ok { // file bytes (an artifact download)
+		w.WriteHeader(reply.Status)
+		_, _ = w.Write(raw)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(reply.Status)

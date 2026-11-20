@@ -8,6 +8,7 @@ package modules
 
 import (
 	"meteorcloud/meteorcli/internal/agent"
+	"meteorcloud/meteorcli/internal/deploy"
 	"meteorcloud/meteorcli/internal/heartbeat"
 )
 
@@ -16,7 +17,8 @@ import (
 // modules (socket, identity) are not listed: they run before enrollment.
 func All() []agent.Module {
 	return []agent.Module{
-		// Actions and deploy kinds come from their registries in later pull requests.
-		&heartbeat.Module{},
+		// Actions come from their registry in a later pull request.
+		&heartbeat.Module{DeployKinds: deploy.Kinds()},
+		&deploy.Module{},
 	}
 }

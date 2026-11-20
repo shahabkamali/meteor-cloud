@@ -97,3 +97,62 @@ func (h Host) installUnit(ctx context.Context, _ localrpc.Peer, raw json.RawMess
 	}
 	return InstallUnitReply{Installed: req.Name, Started: !req.NoStart}, nil
 }
+
+// SystemdControlRequest is the params of systemd.control.
+type SystemdControlRequest struct {
+	// Unit is a .service name; meteorcli's own units are refused.
+	Unit string `json:"unit"`
+	// Action is is-active, start, stop, restart or remove (stop, disable,
+	// delete the unit file from UnitDir, reload).
+	Action string `json:"action"`
+}
+
+// SystemdControlReply is the answer of systemd.control. Active is set for is-active.
+type SystemdControlReply struct {
+	Active bool `json:"active"`
+}
+
+func auditSystemdControl(raw json.RawMessage) []any {
+	var r SystemdControlRequest
+	_ = json.Unmarshal(raw, &r)
+	return []any{"unit", r.Unit, "action", r.Action}
+}
+
+func (h Host) systemdControl(ctx context.Context, _ localrpc.Peer, raw json.RawMessage) (any, error) {
+	var req SystemdControlRequest
+	if err := decode(raw, &req); err != nil {
+		return nil, err
+	}
+	if !validName.MatchString(req.Unit) || !strings.HasSuffix(req.Unit, ".service") || req.Unit == ".service" {
+		return nil, localrpc.Errorf(localrpc.CodeBadRequest, "unit must be a .service name of a-z, 0-9, '.', '_' or '-'")
+	}
+	if strings.HasPrefix(req.Unit, "meteorcli") {
+		return nil, localrpc.Errorf(localrpc.CodeBadRequest, "meteorcli units cannot be changed through the helper")
+	}
+	switch req.Action {
+	case "is-active":
+		// A non-zero exit only means "not active".
+		_, err := h.Run(ctx, "systemctl", "is-active", "--quiet", "--", req.Unit)
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return SystemdControlReply{Active: err == nil}, nil
+	case "start", "stop", "restart":
+		if _, err := h.Run(ctx, "systemctl", req.Action, "--", req.Unit); err != nil {
+			return nil, err
+		}
+		return SystemdControlReply{Active: req.Action != "stop"}, nil
+	case "remove":
+		// Best effort: a unit that is already stopped or disabled is fine.
+		_, _ = h.Run(ctx, "systemctl", "disable", "--now", "--", req.Unit)
+		dest := filepath.Join(h.UnitDir, req.Unit)
+		if err := os.Remove(dest); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		if _, err := h.Run(ctx, "systemctl", "daemon-reload"); err != nil {
+			return nil, err
+		}
+		return SystemdControlReply{}, nil
+	}
+	return nil, localrpc.Errorf(localrpc.CodeBadRequest, "action must be is-active, start, stop, restart or remove")
+}

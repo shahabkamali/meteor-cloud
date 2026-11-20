@@ -59,8 +59,17 @@
             "wireguard": true,
             "ssh": true,
             "actions": [],
-            "deploy_kinds": [],
+            "deploy_kinds": [
+              "systemd",
+              "docker",
+              "docker_compose"
+            ],
             "modules": {
+              "deploy": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
               "heartbeat": {
                 "state": "running",
                 "restarts": 0,
@@ -124,8 +133,17 @@
             "wireguard": true,
             "ssh": true,
             "actions": [],
-            "deploy_kinds": [],
+            "deploy_kinds": [
+              "systemd",
+              "docker",
+              "docker_compose"
+            ],
             "modules": {
+              "deploy": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
               "heartbeat": {
                 "state": "running",
                 "restarts": 0,

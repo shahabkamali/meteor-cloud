@@ -32,6 +32,9 @@ func Call(ctx context.Context, path, method string, params, out any) error {
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
 	}
+	// Cancelling ctx (the agent stopping) ends a long call at once, not at its deadline.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 	req := Request{Method: method}
 	if params != nil {
 		if req.Params, err = json.Marshal(params); err != nil {
@@ -46,6 +49,9 @@ func Call(ctx context.Context, path, method string, params, out any) error {
 	}
 	var resp Response
 	if err := json.NewDecoder(io.LimitReader(conn, 16<<20)).Decode(&resp); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s: %w", method, ctx.Err())
+		}
 		if closedEarly(err) {
 			return busy(method)
 		}

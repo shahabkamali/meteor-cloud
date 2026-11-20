@@ -13,9 +13,12 @@ Differences from the Python adapter, all on the device side of the contract:
   honours ``Retry-After``, so ``enroll`` takes about 25 s.
 - ``run`` lets the running agent beat and counts heartbeats at the fake control plane.
 - Host tools are fake programs on PATH (``docker`` answers ``compose version``; ``wg``,
-  ``wg-quick`` and ``sshd`` exist); the agent touches nothing else on the host yet.
-- Features: background enrollment (approval with no command, across restarts) and the server's
-  heartbeat interval. MQTT, actions, Wi-Fi, WireGuard and deploys come in later pull requests.
+  ``wg-quick`` and ``sshd`` exist), so the agent reports them installed.
+- Privileged work goes to the root helper, as on a device; ``harness/helper.py`` plays it on
+  ``<root>/run/meteorcli/helper.sock`` and hands docker work to the simulated device.
+- Features: background enrollment (approval with no command, across restarts), the server's
+  heartbeat interval, and deploys that run beside the heartbeat (``background_deploy``). MQTT,
+  actions, Wi-Fi and WireGuard come in later pull requests.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import pytest
 
 from harness.device import SimulatedDevice
 from harness.fake_cp import FakeControlPlane
+from harness.helper import FakeHelper
 
 SOURCE = Path(__file__).resolve().parents[3] / "src" / "device-plane" / "agent-go"
 VERSION = "0.0.0"
@@ -68,10 +72,10 @@ def binary() -> Path:
 
 class GoAgent:
     name = "go"
-    features = frozenset({"background_enrollment", "server_heartbeat_interval"})
+    features = frozenset({"background_enrollment", "server_heartbeat_interval", "background_deploy"})
 
     def __init__(self, workdir: Path, device: SimulatedDevice, plane: FakeControlPlane) -> None:
-        self.device = device  # unused until host work moves to the Go agent
+        self.device = device
         self.plane = plane
         self.bin = binary()
         # Unix socket paths are limited to 108 bytes; pytest's tmp_path can be longer.
@@ -86,6 +90,8 @@ class GoAgent:
             self.env.pop(key, None)
         self.log = workdir / "agent.log"
         self._proc: subprocess.Popen[bytes] | None = None
+        self.helper = FakeHelper(self.root / "run" / "meteorcli" / "helper.sock",
+                                 self.root / "var" / "lib" / "meteorcli" / "artifacts", device)
         try:
             self.start()
         except BaseException:
@@ -128,6 +134,7 @@ class GoAgent:
 
     def close(self) -> None:
         self.stop()
+        self.helper.close()
         shutil.rmtree(self.root, ignore_errors=True)
 
     # ------------------------------------------------------------------ commands
@@ -168,6 +175,17 @@ class GoAgent:
                 time.sleep(0.02)
             if between is not None:
                 between(beat)
+        return self.stop()
+
+    def run_until(self, done: Callable[[], bool], timeout: float = 60) -> int:
+        """Let the running agent work until ``done()`` holds, then stop it."""
+        deadline = time.monotonic() + timeout
+        while not done():
+            if self._proc is None or self._proc.poll() is not None:
+                pytest.fail(f"the Go agent exited:\n{self.log.read_text(errors='replace')}")
+            if time.monotonic() > deadline:
+                pytest.fail(f"the agent did not get there within {timeout:.0f} s:\n{self.log.read_text(errors='replace')}")
+            time.sleep(0.02)
         return self.stop()
 
     @property

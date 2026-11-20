@@ -4,7 +4,7 @@ Checks that a device agent speaks [contracts/device-agent-v1.md](../../contracts
 exactly: every HTTP request and answer, every MQTT message, the new headers and capabilities.
 It runs the Python `meteorcli` and the Go `meteorcli` (`src/device-plane/agent-go`), which must
 produce the same recordings. Scenarios need features (`@pytest.mark.requires`); an adapter without
-one skips the scenario (the Go agent lacks MQTT, actions, Wi-Fi, WireGuard and deploys for now).
+one skips the scenario (the Go agent lacks MQTT, actions, Wi-Fi and WireGuard for now).
 
 ```bash
 make agent-contract-test          # verify, then replay
@@ -19,7 +19,8 @@ make agent-contract-test          # verify, then replay
   observer plays the server side: it watches `devices/<id>/#`, sends `ping` and `sync_desired`, and
   checks QoS, schemas and the retained status.
 - **Simulated device** (`harness/device.py`): docker, Wi-Fi, WireGuard and reboot go here, never to
-  the host. Scenarios assert on what it was asked to do.
+  the host. Scenarios assert on what it was asked to do. The Go agent asks its root helper for
+  privileged work; `harness/helper.py` serves the helper socket and passes the work to the device.
 - **Adapters** drive the agent through `register`, `configure`, `test`, `request_token`, `claim` and
   `run(heartbeats, between)`. `agents/python_agent.py` runs the Python agent in-process with its real
   HTTP and MQTT clients. `agents/go_agent.py` builds the Go binary, runs `meteorcli agent` as a
@@ -53,6 +54,7 @@ Re-record only when an exchange changed on purpose, and review the diff like cod
 | `wireguard` | key registration, tunnel up, SSH CA trusted and reported at once |
 | `docker_deploy` | signed docker release, key pinning, download through a storage redirect without the token, progress and `in_sync` reports |
 | `heartbeat` (Go) | `register`, first heartbeat within 5 s, the server's 5 s interval used for the next, `capabilities.modules` |
+| `software_deploy` (Go) | the same signed docker release deployed beside the heartbeat: progress-only heartbeats, the root helper (played by `harness/helper.py`) loads and runs the image, `in_sync` with the next full heartbeat, a health check only on the next cycle |
 | `enroll_reboot` (Go) | `request-token`, agent restarted while pending, approved meanwhile: enrolled and heartbeating with no command |
 
 Not covered yet: `update_agent` (starts the real updater), `docker_compose` and `systemd`

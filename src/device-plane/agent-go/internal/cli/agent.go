@@ -74,6 +74,10 @@ func runAgent(ctx context.Context, env *Env, args []string) int {
 		core.Error("identity directory", "err", err)
 		return 1
 	}
+	if err := os.MkdirAll(p.ArtifactsDir, 0o750); err != nil {
+		core.Error("artifacts directory", "err", err)
+		return 1
+	}
 
 	host := platform.System()
 	signals, health := agent.NewSignals(), agent.NewHealth()

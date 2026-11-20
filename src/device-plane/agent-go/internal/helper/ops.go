@@ -33,13 +33,24 @@ type Host struct {
 	Run func(ctx context.Context, name string, args ...string) ([]byte, error)
 	// Stream executes a tool like Run but writes its stdout to w as it comes.
 	Stream func(ctx context.Context, w io.Writer, name string, args ...string) error
+	// RunStdin executes a tool like Run with stdin connected to r.
+	RunStdin func(ctx context.Context, r io.Reader, name string, args ...string) ([]byte, error)
 	// UnitDir is where systemd.install_unit writes units.
 	UnitDir string
+	// ArtifactsDir is the agent's artifact directory: the only place docker.load
+	// reads from, and the parent of the compose project directories.
+	ArtifactsDir string
+	// TempDir holds short-lived files such as a container's env file ("" means
+	// os.TempDir(); the helper unit has PrivateTmp).
+	TempDir string
 }
 
 // SystemHost runs real tools from safePath and writes to /etc/systemd/system.
 func SystemHost() Host {
-	return Host{Run: runTool, Stream: streamTool, UnitDir: "/etc/systemd/system"}
+	return Host{
+		Run: runTool, Stream: streamTool, RunStdin: runToolStdin,
+		UnitDir: "/etc/systemd/system", ArtifactsDir: "/var/lib/meteorcli/artifacts",
+	}
 }
 
 // lookTool finds name in safePath only, never in the helper's own PATH.
@@ -62,8 +73,22 @@ func command(ctx context.Context, name string, args []string) (*exec.Cmd, error)
 		return nil, err
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Env = []string{"PATH=" + safePath, "LANG=C.UTF-8"}
+	// HOME lets the docker CLI find its (empty) config; the helper unit makes it read-only.
+	cmd.Env = []string{"PATH=" + safePath, "LANG=C.UTF-8", "HOME=/root"}
+	// A tool that ignores the kill is waited for at most this long after ctx ends.
+	cmd.WaitDelay = 10 * time.Second
 	return cmd, nil
+}
+
+func runToolStdin(ctx context.Context, r io.Reader, name string, args ...string) ([]byte, error) {
+	cmd, err := command(ctx, name, args)
+	if err != nil {
+		return nil, err
+	}
+	out := &capped{max: maxOutput}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = r, out, out
+	err = finish(ctx, cmd.Run(), name, args, out.String())
+	return out.Bytes(), err
 }
 
 func runTool(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -118,6 +143,14 @@ func Ops(h Host) map[string]localrpc.Handler {
 		"power.shutdown":       {Timeout: 30 * time.Second, Run: h.powerShutdown},
 		"logs.read":            {Timeout: 30 * time.Second, Run: h.logsRead, Audit: auditLogs},
 		"systemd.install_unit": {Timeout: 2 * time.Minute, Run: h.installUnit, Audit: auditInstallUnit},
+		"systemd.control":      {Timeout: 2 * time.Minute, Run: h.systemdControl, Audit: auditSystemdControl},
+		"docker.load":          {Timeout: slowDocker, Run: h.dockerLoad, Audit: auditDocker},
+		"docker.run":           {Timeout: slowDocker, Run: h.dockerRun, Audit: auditDocker},
+		"docker.inspect":       {Timeout: quickDocker, Run: h.dockerInspect, Audit: auditDocker},
+		"docker.control":       {Timeout: 2 * time.Minute, Run: h.dockerControl, Audit: auditDocker},
+		"compose.up":           {Timeout: slowDocker, Run: h.composeUp, Audit: auditCompose},
+		"compose.ps":           {Timeout: quickDocker, Run: h.composePS, Audit: auditCompose},
+		"compose.control":      {Timeout: 5 * time.Minute, Run: h.composeControl, Audit: auditCompose},
 	}
 }
 

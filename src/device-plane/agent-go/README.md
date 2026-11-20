@@ -14,7 +14,10 @@ internal/config/    paths, config.json, atomic writes, Python import
 internal/state/     versioned state files, outbox
 internal/api/       typed client for /api/v1/agent/*
 internal/localrpc/  JSON request/answer over Unix sockets, SO_PEERCRED, audit lines
-internal/helper/    root helper: uid check, operation allowlist (power, logs, systemd)
+internal/helper/    root helper: uid check, operation allowlist (power, logs, systemd, docker, compose)
+internal/signing/   signed desired software: canonical JSON, Ed25519, pinned organization keys
+internal/deploy/    deploy module: reconcile, applied state, health gate, rollback; runtimes.go
+internal/deploy/runtime/  Runtime interface; systemd/, docker/, compose/ runtimes
 internal/cli/       one file per command, commands.go lists them
 packaging/          systemd units, sysusers.d, tmpfiles.d
 scripts/            build.sh (cross-build + size budget), check-coverage.sh

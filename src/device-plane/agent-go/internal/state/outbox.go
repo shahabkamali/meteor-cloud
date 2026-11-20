@@ -24,6 +24,12 @@ const reportVersion = 1
 // accepted the heartbeat; the deploy module puts them.
 const KindSoftwareReport = "software_report"
 
+// KindEvent is the outbox kind of device events (mqtt/events.json), such as the
+// deploy module's app.started. The MQTT bus publishes them on
+// devices/{id}/events and acks them once the broker accepted them. Put them with
+// a key so a device without a broker keeps only the latest few.
+const KindEvent = "event"
+
 // DefaultOutboxLimit bounds the outbox so a device offline for weeks cannot fill
 // its disk. The oldest reports go first.
 const DefaultOutboxLimit = 500
