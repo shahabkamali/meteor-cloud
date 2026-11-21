@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from edge_agent.config import AgentConfig, AgentPaths, load_config, save_config
+from edge_agent.persist import STAGING_DIRNAME
 
 SYSTEM_CONFIG_DIR = Path("/etc/meteorcli")
+# Installed by installcli.sh --with-service (and the device Ansible role); it reads SYSTEM_CONFIG_DIR.
+SERVICE_UNIT = Path("/etc/systemd/system/meteorcli.service")
 
 
 def _sudo_user() -> str | None:
@@ -36,10 +40,18 @@ def _user_home(username: str | None = None) -> Path:
 
 
 def default_config_dir() -> Path:
-    """Per-user config dir, including when the command is run via sudo.
+    """Config dir for this command.
 
-    Only an interactive root login (no SUDO_USER) uses ``/etc/meteorcli``.
+    When meteorcli.service is installed, everyone uses ``/etc/meteorcli``, the
+    identity the service runs: enrolling into ``~/.config`` would leave the service
+    waiting forever. Writing there needs root (or a dir chowned by an earlier sudo
+    run); ``main`` turns the permission error into a "use sudo" hint.
+
+    Without the service, root uses ``/etc/meteorcli`` when there is no SUDO_USER,
+    and everyone else (including sudo) uses the invoking user's config dir.
     """
+    if SERVICE_UNIT.exists():
+        return SYSTEM_CONFIG_DIR
     sudo_user = _sudo_user()
     if _is_root() and sudo_user is None:
         return SYSTEM_CONFIG_DIR
@@ -163,14 +175,48 @@ def resolve_server_url(config: AgentConfig | None, *, override: str | None = Non
     return None
 
 
+def lan_host_missing_port(value: str) -> bool:
+    """True when a LAN/IP host has no port (make dev API is :8000)."""
+    try:
+        _, host = _split_scheme_host(value)
+    except ValueError:
+        return False
+    if not host or not _host_is_local(host):
+        return False
+    hostname = _hostname_of(host)
+    return hostname == host
+
+
+def drop_stale_enrollment(paths: CliPaths) -> list[str]:
+    """Remove credentials left over from a previous server.
+
+    That is the device token, MQTT files, claim secret and API key (keys are issued per
+    server), plus an uncommitted staging journal: a finished journal would otherwise be
+    committed on the next read and bring the old server's credentials back.
+    """
+    removed: list[str] = []
+    base = paths.config_path.parent
+    staging = base / STAGING_DIRNAME
+    if staging.is_dir():
+        shutil.rmtree(staging)
+        removed.append(STAGING_DIRNAME)
+    for name in ("device-token", "mqtt.json", "mqtt-ca.crt", "claim-secret", "api-key"):
+        path = base / name
+        if path.is_file():
+            path.unlink()
+            removed.append(name)
+    return removed
+
+
 def persist_connection(
     paths: CliPaths,
     *,
     domain: str | None = None,
     api_base: str | None = None,
     http: bool = False,
-) -> AgentConfig:
+) -> tuple[AgentConfig, list[str]]:
     existing = load_config(paths.agent_paths()) or AgentConfig(server_url="")
+    previous = resolve_server_url(existing)
     if domain is not None:
         existing.domain = domain
         if api_base is None and not http:
@@ -182,5 +228,12 @@ def persist_connection(
     resolved = resolve_server_url(existing)
     if resolved:
         existing.server_url = resolved
+    dropped: list[str] = []
+    if previous and resolved and previous.rstrip("/") != resolved.rstrip("/"):
+        # Clean up before saving the new URL: if this is interrupted, the next run still
+        # sees a server change and retries, instead of sending the old token to the new server.
+        dropped = drop_stale_enrollment(paths)
+        existing.device_id = ""
+        existing.organization_id = ""
     save_config(paths.agent_paths(), existing)
-    return existing
+    return existing, dropped

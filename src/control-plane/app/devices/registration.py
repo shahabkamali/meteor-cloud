@@ -8,15 +8,20 @@ are never logged.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import hmac
+import re
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.audit.service import AuditRecorder
 from app.core.config import Settings, get_settings
-from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.exceptions import ConflictError, NotFoundError, UnauthorizedError
+from app.core.metrics import AGENT_HEARTBEATS, DEVICE_REGISTRATIONS
 from app.devices.identity import DeviceIdentity, match_existing_device
 from app.devices.models import Device, RegistrationToken
-from app.devices.repository import DeviceRepository, RegistrationTokenRepository
+from app.devices.naming import chosen_name, default_device_name, device_type_slug_for, unique_device_name
+from app.devices.repository import DeviceRepository, DeviceTypeRepository, RegistrationTokenRepository
 from app.devices.schemas import (
     AgentHeartbeatRequest,
     AgentHeartbeatResponse,
@@ -25,7 +30,11 @@ from app.devices.schemas import (
 )
 from app.devices.status import connectivity_status
 from app.devices.tokens import generate_device_token, hash_token
-from app.mqtt.credentials import issue_mqtt_credentials
+from app.mqtt.credentials import issue_mqtt_credentials, mqtt_config_version
+from app.mqtt.schemas import AgentMqttCredentialsResponse, AgentMqttStatusResponse
+
+# Match agent-v* / pyproject versions (X.Y.Z plus optional pre-release suffix).
+_AGENT_VERSION = re.compile(r"^\d+\.\d+\.\d+[0-9A-Za-z._-]*$")
 
 
 class RegistrationService:
@@ -38,8 +47,15 @@ class RegistrationService:
     def register(self, payload: AgentRegisterRequest) -> AgentRegisterResponse:
         try:
             return self._register(payload)
-        except Exception:
+        except Exception as exc:
             self.session.rollback()
+            if isinstance(exc, UnauthorizedError):
+                result = "invalid_token"
+            elif isinstance(exc, ConflictError):
+                result = "conflict"
+            else:
+                result = "error"
+            DEVICE_REGISTRATIONS.labels(result=result).inc()
             raise
 
     def _register(self, payload: AgentRegisterRequest) -> AgentRegisterResponse:
@@ -50,9 +66,12 @@ class RegistrationService:
             mac_addresses=payload.mac_addresses,
         )
 
+        # Lock matching rows before the window/proof check so two concurrent
+        # requests cannot both consume an administrator window or rotate credentials.
         candidates = self.devices.list_candidates_for_identity(
             serial_number=identity.serial_number,
             mac_addresses=identity.mac_addresses,
+            for_update=True,
         )
         match = match_existing_device(
             identity,
@@ -74,6 +93,7 @@ class RegistrationService:
         now = datetime.now(UTC)
 
         if match.device is not None:
+            self._require_reregistration_allowed(match.device, payload, now)
             device = self._update_existing(match.device, payload, identity, token, generated, now)
         else:
             device = self._create_new(payload, identity, token, generated, now)
@@ -82,9 +102,23 @@ class RegistrationService:
         self.tokens.update(token)
 
         mqtt = issue_mqtt_credentials(self.session, device, self.settings)
+        AuditRecorder(self.session).record(
+            organization_id=device.organization_id,
+            action="device.reregister" if match.device is not None else "device.register",
+            resource_type="device",
+            resource_id=device.id,
+            actor_type="registration_token",
+            actor_id=token.id,
+            metadata={
+                "name": device.name,
+                "registration_token_id": str(token.id),
+                "credential_prefix": generated.display_prefix,
+            },
+        )
 
         self.session.commit()
         self.session.refresh(device)
+        DEVICE_REGISTRATIONS.labels(result="reregistered" if match.device is not None else "created").inc()
 
         return AgentRegisterResponse(
             device_id=device.id,
@@ -93,6 +127,46 @@ class RegistrationService:
             name=device.name,
             heartbeat_interval_seconds=self.settings.device_heartbeat_interval_seconds,
             mqtt=mqtt,
+        )
+
+    def _require_reregistration_allowed(self, device: Device, payload: AgentRegisterRequest, now: datetime) -> None:
+        """Known hardware may take over its device record only with proof.
+
+        Serials and MACs are not secrets, so a registration token alone must not rotate an
+        existing device's credentials. Proof is the device's current token, or a window an
+        administrator opened with "Allow re-registration". A disabled device stays disabled.
+        """
+        if not device.is_enabled:
+            raise ConflictError(
+                "device_disabled",
+                "This hardware is registered as a disabled device. An administrator must enable it first.",
+            )
+        if payload.device_token:
+            presented = hash_token(payload.device_token)
+            if device.credential_hash and hmac.compare_digest(presented, device.credential_hash):
+                return
+            # Lost-response retry: the previous rotation may have committed while the
+            # agent still holds the old token.
+            previous_until = device.previous_credential_until
+            if (
+                device.previous_credential_hash
+                and previous_until is not None
+                and hmac.compare_digest(presented, device.previous_credential_hash)
+            ):
+                if previous_until.tzinfo is None:
+                    previous_until = previous_until.replace(tzinfo=UTC)
+                if previous_until > now:
+                    return
+        allowed_until = device.reregistration_allowed_until
+        if allowed_until is not None:
+            if allowed_until.tzinfo is None:
+                allowed_until = allowed_until.replace(tzinfo=UTC)
+            if allowed_until > now:
+                return
+        raise ConflictError(
+            "device_already_registered",
+            f"This hardware is already registered as device '{device.name}'. "
+            "An administrator can allow re-registration for that device, or delete it.",
         )
 
     def _validate_token(self, plaintext: str) -> RegistrationToken:
@@ -123,13 +197,28 @@ class RegistrationService:
             )
         return token
 
-    def _resolve_name(self, payload: AgentRegisterRequest, identity: DeviceIdentity) -> str:
-        candidate = payload.name or payload.hostname or identity.serial_number
-        if not candidate and identity.mac_addresses:
-            candidate = identity.mac_addresses[0]
-        if candidate:
-            return candidate.strip()[:255]
-        return "unnamed-device"
+    def _resolve_name(self, payload: AgentRegisterRequest, identity: DeviceIdentity, token: RegistrationToken) -> str:
+        organization_id = token.organization_id
+        self.devices.lock_names(organization_id=organization_id)
+        # A single-use token is how the console defines one device: its name is the device's name.
+        token_name = token.name.strip() if token.max_uses == 1 else ""
+        return unique_device_name(
+            chosen_name(payload.name, payload.hostname)
+            or token_name
+            or default_device_name(
+                requested_name=payload.name,
+                hostname=payload.hostname,
+                serial_number=identity.serial_number,
+                mac_addresses=identity.mac_addresses,
+                device_type_slug=device_type_slug_for(
+                    token.device_type_id,
+                    payload.hardware_model,
+                    DeviceTypeRepository(self.session).list(organization_id=organization_id),
+                ),
+                hardware_model=payload.hardware_model,
+            ),
+            taken=self.devices.taken_names(organization_id=organization_id),
+        )
 
     def _apply_inventory(
         self,
@@ -144,9 +233,14 @@ class RegistrationService:
         device.os_version = payload.os_version
         device.kernel_version = payload.kernel_version
         device.architecture = payload.architecture
+        device.hardware_model = payload.hardware_model
         device.cpu_model = payload.cpu_model
         device.cpu_cores = payload.cpu_cores
         device.memory_mb = payload.memory_mb
+        device.local_ip = payload.local_ip
+        version = (payload.agent_version or "").strip()
+        if version and _AGENT_VERSION.match(version):
+            device.agent_version = version
         if payload.labels:
             device.labels = payload.labels
         if payload.metadata:
@@ -162,7 +256,7 @@ class RegistrationService:
     ) -> Device:
         device = Device(
             organization_id=token.organization_id,
-            name=self._resolve_name(payload, identity),
+            name=self._resolve_name(payload, identity, token),
             device_type_id=token.device_type_id,
             device_group_id=token.device_group_id,
             is_enabled=True,
@@ -186,21 +280,109 @@ class RegistrationService:
         generated,
         now: datetime,
     ) -> Device:
-        if payload.name:
-            device.name = payload.name.strip()[:255]
+        requested = chosen_name(payload.name, payload.hostname)
+        if requested:
+            if requested.casefold() != device.name.casefold():
+                self.devices.lock_names(organization_id=device.organization_id)
+                taken = self.devices.taken_names(organization_id=device.organization_id)
+                taken.discard(device.name.casefold())
+                requested = unique_device_name(requested, taken=taken)
+            device.name = requested
         # Token-bound assignments apply on re-registration when provided.
         if token.device_type_id is not None:
             device.device_type_id = token.device_type_id
         if token.device_group_id is not None:
             device.device_group_id = token.device_group_id
         self._apply_inventory(device, payload, identity)
+        if device.credential_hash:
+            device.previous_credential_hash = device.credential_hash
+            device.previous_credential_until = now + timedelta(
+                seconds=self.settings.device_registration_retry_seconds
+            )
         device.credential_hash = generated.token_hash
         device.credential_prefix = generated.display_prefix
         device.last_seen_at = now
         device.registered_at = now
         device.registration_token_id = token.id
-        device.is_enabled = True
+        device.reregistration_allowed_until = None
         return self.devices.update(device)
+
+    def mqtt_status(self) -> AgentMqttStatusResponse:
+        if not self.settings.mqtt_enabled:
+            return AgentMqttStatusResponse(enabled=False)
+        return AgentMqttStatusResponse(enabled=True, config_version=mqtt_config_version(self.settings))
+
+    def reissue_mqtt_credentials(self, *, device: Device) -> AgentMqttCredentialsResponse:
+        """New password and the current CA, for devices registered before MQTT or a CA change."""
+        if not self.settings.mqtt_enabled:
+            raise NotFoundError("mqtt_disabled", "MQTT is not enabled on this server.")
+        try:
+            info = issue_mqtt_credentials(self.session, device, self.settings)
+            AuditRecorder(self.session).record(
+                organization_id=device.organization_id,
+                action="device.mqtt_credential.issue",
+                resource_type="device",
+                resource_id=device.id,
+                actor_type="device",
+                actor_id=device.id,
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return AgentMqttCredentialsResponse(**info.model_dump(), config_version=mqtt_config_version(self.settings))
+
+    def _refresh_inventory(self, device: Device, payload: AgentHeartbeatRequest) -> None:
+        """Apply inventory the agent sent. Omitted or blank values stay as they were."""
+        if payload.hostname is not None:
+            device.hostname = payload.hostname
+        if payload.os_name:
+            device.os_name = payload.os_name
+        if payload.os_version is not None:
+            device.os_version = payload.os_version
+        if payload.kernel_version is not None:
+            device.kernel_version = payload.kernel_version
+        if payload.architecture:
+            device.architecture = payload.architecture
+        serial = (payload.serial_number or "").strip()
+        if serial and not self._identity_in_use(device, serial_number=serial, mac_addresses=()):
+            device.serial_number = serial
+        if payload.mac_addresses:
+            macs = DeviceIdentity.from_inventory(
+                serial_number=None,
+                mac_addresses=payload.mac_addresses,
+            ).mac_addresses
+            if macs and not self._identity_in_use(device, serial_number=None, mac_addresses=macs):
+                device.mac_addresses = macs
+        if payload.hardware_model:
+            device.hardware_model = payload.hardware_model
+        if payload.cpu_model:
+            device.cpu_model = payload.cpu_model
+        if payload.cpu_cores:
+            device.cpu_cores = payload.cpu_cores
+        if payload.memory_mb:
+            device.memory_mb = payload.memory_mb
+        if payload.local_ip:
+            device.local_ip = payload.local_ip
+        version = (payload.agent_version or "").strip()
+        if version and _AGENT_VERSION.match(version):
+            device.agent_version = version
+
+    def _identity_in_use(
+        self,
+        device: Device,
+        *,
+        serial_number: str | None,
+        mac_addresses: list[str] | tuple[str, ...],
+    ) -> bool:
+        """Whether some other device already stores this serial or any of these MACs."""
+        return any(
+            candidate.id != device.id
+            for candidate in self.devices.list_candidates_for_identity(
+                serial_number=serial_number,
+                mac_addresses=mac_addresses,
+            )
+        )
 
     def heartbeat(
         self,
@@ -208,17 +390,38 @@ class RegistrationService:
         device: Device,
         payload: AgentHeartbeatRequest,
     ) -> AgentHeartbeatResponse:
+        from app.deployments.software_schemas import SoftwareReportItem
+        from app.deployments.software_service import DeviceSoftwareService
+        from app.device_actions.service import DeviceActionService
+        from app.network.service import DeviceWifiService
+
         now = datetime.now(UTC)
         device.last_seen_at = now
-        if payload.hostname is not None:
-            device.hostname = payload.hostname
-        if payload.os_version is not None:
-            device.os_version = payload.os_version
-        if payload.kernel_version is not None:
-            device.kernel_version = payload.kernel_version
+        self._refresh_inventory(device, payload)
         self.devices.update(device)
+
+        software = DeviceSoftwareService(self.session)
+        if payload.capabilities:
+            software.apply_capabilities(device_id=device.id, capabilities=payload.capabilities)
+        if payload.software_report:
+            reports: list[SoftwareReportItem] = []
+            for raw in payload.software_report:
+                try:
+                    reports.append(SoftwareReportItem.model_validate(raw))
+                except Exception:
+                    continue
+            if reports:
+                software.apply_software_reports(
+                    organization_id=device.organization_id,
+                    device_id=device.id,
+                    reports=reports,
+                    commit=False,
+                )
+
         self.session.commit()
+        AGENT_HEARTBEATS.inc()
         self.session.refresh(device)
+        desired = [item.model_dump(mode="json") for item in software.list_desired_for_agent(device_id=device.id)]
         return AgentHeartbeatResponse(
             device_id=device.id,
             status=connectivity_status(
@@ -228,4 +431,7 @@ class RegistrationService:
             ),
             heartbeat_interval_seconds=self.settings.device_heartbeat_interval_seconds,
             server_time=now,
+            desired_software=desired,
+            wifi_pending=DeviceWifiService(self.session, self.settings).has_pending(device.id),
+            actions_pending=DeviceActionService(self.session, self.settings).has_pending(device.id),
         )

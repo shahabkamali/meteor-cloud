@@ -71,12 +71,13 @@ def test_normalize_device_topic() -> None:
         normalize_device_topic(device, "commands", action="subscribe")
         == f"devices/{device}/commands"
     )
+    assert normalize_device_topic(device, "events") == f"devices/{device}/events"
     try:
-        normalize_device_topic(device, "events")
+        normalize_device_topic(device, "telemetry")
     except ValueError as exc:
         assert "must be one of" in str(exc)
     else:
-        raise AssertionError("expected events topic to fail")
+        raise AssertionError("expected an unknown topic to fail")
     try:
         normalize_device_topic(device, "devices/11111111-1111-1111-1111-111111111111/status")
     except ValueError as exc:
@@ -330,7 +331,8 @@ def test_run_continues_if_mqtt_config_read_fails(agent_paths, monkeypatch) -> No
     assert stopped == []
 
 
-def test_meteorcli_run_stops_mqtt_if_start_fails(agent_paths, monkeypatch) -> None:
+def test_meteorcli_run_syncs_mqtt_each_heartbeat_and_stops_it(agent_paths, monkeypatch) -> None:
+    """MQTT (re)starts from the heartbeat, so a failed start or stale CA is retried."""
     import argparse
 
     from edge_agent.config import AgentConfig, save_config
@@ -348,28 +350,34 @@ def test_meteorcli_run_stops_mqtt_if_start_fails(agent_paths, monkeypatch) -> No
         ),
     )
     write_device_token(agent_paths.token_path, "dev_secret")
-    ran: list[str] = []
-    stopped: list[str] = []
+    events: list[str] = []
 
-    class BoomSession:
-        def start(self) -> None:
-            raise OSError("broker down")
+    class FakeSupervisor:
+        def __init__(self, device_id, config_dir, *, server_url=None) -> None:
+            events.append(f"init:{device_id}")
+
+        def sync(self, client, device_token) -> None:
+            events.append("sync")
+            raise OSError("broker down")  # logged; heartbeats continue
 
         def stop(self) -> None:
-            stopped.append("stop")
+            events.append("stop")
 
-    monkeypatch.setattr(
-        "edge_agent.mqtt_config.read_mqtt_config",
-        lambda _dir: MqttConfig(host="localhost", port=8883, username="u", password="p"),
-    )
-    monkeypatch.setattr("edge_agent.mqtt.DeviceMqttSession", lambda *_a, **_k: BoomSession())
-    monkeypatch.setattr("meteorcli.cli.run_loop", lambda *_a, **_k: ran.append("hb"))
+    def two_beats(*_a, payload_factory, **_k) -> None:
+        payload_factory()
+        payload_factory()
+
+    monkeypatch.setattr("edge_agent.mqtt_sync.MqttSupervisor", FakeSupervisor)
+    monkeypatch.setattr("edge_agent.wireguard.sync_connectivity", lambda *_a, **_k: None)
+    monkeypatch.setattr("meteorcli.cli.reconcile_software", lambda *_a, **_k: [])
+    monkeypatch.setattr("meteorcli.cli.collect_capabilities", lambda: {})
+    monkeypatch.setattr("meteorcli.cli.run_loop", two_beats)
     monkeypatch.setattr("meteorcli.cli.EdgeClient", lambda _url: object())
+    monkeypatch.setattr("meteorcli.cli.service_state", lambda: "not installed")
     args = argparse.Namespace(
         config_dir=str(agent_paths.config_path.parent),
         once=False,
         interval=None,
     )
     assert meteorcli._cmd_run(args) == 0
-    assert ran == ["hb"]
-    assert stopped == ["stop"]
+    assert events == ["init:device-1", "sync", "sync", "stop"]

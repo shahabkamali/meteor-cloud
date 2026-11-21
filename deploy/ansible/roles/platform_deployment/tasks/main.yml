@@ -1,0 +1,366 @@
+---
+- name: Build the Compose command
+  ansible.builtin.set_fact:
+    platform_compose: >-
+      docker compose -f docker-compose.yml -f docker-compose.prod.yml
+      {{ '-f docker-compose.vpn.yml' if connectivity_provider == 'wireguard' else '' }}
+      {{ '-f docker-compose.observability.yml' if observability_enabled | bool else '' }}
+
+- name: Fetch application source for image builds
+  when: image_source in ['git', 'archive']
+  block:
+    - name: Clone or update platform repository
+      ansible.builtin.git:
+        repo: "{{ repository_url }}"
+        dest: "{{ platform_source_dir }}"
+        version: "{{ git_ref }}"
+        force: true
+      register: platform_source_git
+      when: image_source == 'git'
+
+    - name: Copy the platform source archive
+      ansible.builtin.copy:
+        src: "{{ platform_source_archive }}"
+        dest: "{{ platform_root }}/source.tar.gz"
+        owner: root
+        group: root
+        mode: "0600"
+      register: platform_source_copy
+      when: image_source == 'archive'
+
+    # Replace the tree so files removed from the archive do not linger.
+    - name: Remove the previous source tree
+      ansible.builtin.file:
+        path: "{{ platform_source_dir }}"
+        state: absent
+      when: image_source == 'archive' and platform_source_copy is changed
+
+    - name: Create the source directory
+      ansible.builtin.file:
+        path: "{{ platform_source_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: image_source == 'archive'
+
+    - name: Unpack the platform source archive
+      ansible.builtin.unarchive:
+        src: "{{ platform_root }}/source.tar.gz"
+        dest: "{{ platform_source_dir }}"
+        remote_src: true
+      when: image_source == 'archive' and platform_source_copy is changed
+
+    - name: Record whether the source changed
+      ansible.builtin.set_fact:
+        platform_source: {changed: "{{ platform_source_git is changed or platform_source_copy is changed }}"}
+
+    - name: Check for existing application images
+      ansible.builtin.command:
+        cmd: docker image inspect {{ platform_built_images | join(' ') }}
+      vars:
+        platform_bundled_mosquitto: "{{ mqtt_enabled | bool and mqtt_broker == 'bundled' and mqtt_provider == 'mosquitto' }}"
+        platform_built_images: >-
+          {{ [backend_image, frontend_image]
+             + ([data_plane_image] if mqtt_enabled | bool and data_plane_gateway == 'python' else [])
+             + ([data_api_image] if data_api_enabled | bool or (mqtt_enabled | bool and data_plane_gateway != 'python') else [])
+             + ([mosquitto_image] if platform_bundled_mosquitto | bool else []) }}
+      register: platform_images
+      changed_when: false
+      failed_when: false
+
+    - name: Build application images
+      ansible.builtin.command:
+        cmd: "{{ platform_compose }} build"
+        chdir: "{{ platform_compose_dir }}"
+      when: platform_source.changed | bool or platform_images.rc != 0
+      changed_when: true
+
+- name: Pull container images
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} pull --quiet"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_pull
+  changed_when: false
+  when: image_source == 'registry' and image_pull_policy != 'never'
+
+# POSTGRES_PASSWORD is applied only on first init. Re-runs that generated a new
+# secret (or reused ~/.meteorcloud/secrets.env against an older volume) leave
+# the role password unchanged and the API fails with "password authentication
+# failed". Start Postgres first and reset the role over the local trust socket.
+# Copy the helper into the container: `compose exec -T` does not keep stdin.
+- name: Install PostgreSQL password helper
+  when: postgres_provider == 'bundled'
+  ansible.builtin.copy:
+    src: align-postgres-password.sh
+    dest: "{{ platform_root }}/align-postgres-password.sh"
+    owner: "{{ platform_owner }}"
+    group: "{{ platform_owner }}"
+    mode: "0755"
+
+- name: Start bundled PostgreSQL
+  when: postgres_provider == 'bundled'
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} up -d --wait --wait-timeout {{ platform_postgres_start_timeout_seconds | default(60) }} postgres"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_postgres_up
+  changed_when: platform_postgres_up.stderr is search('Creat|Recreat|Start(ed|ing)')
+
+- name: Copy PostgreSQL password helper into the container
+  when: postgres_provider == 'bundled'
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} cp {{ platform_root }}/align-postgres-password.sh postgres:/tmp/align-postgres-password.sh"
+    chdir: "{{ platform_compose_dir }}"
+  changed_when: false
+
+- name: Check whether bundled PostgreSQL accepts the current password
+  when: postgres_provider == 'bundled'
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} exec -T postgres sh /tmp/align-postgres-password.sh check"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_postgres_auth
+  changed_when: false
+  failed_when: false
+
+- name: Align bundled PostgreSQL password with current secrets
+  when: postgres_provider == 'bundled' and platform_postgres_auth.rc != 0
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} exec -T postgres sh /tmp/align-postgres-password.sh align"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_postgres_align
+  changed_when: "'ALTER ROLE' in platform_postgres_align.stdout"
+
+- name: Confirm bundled PostgreSQL accepts the current password
+  when: postgres_provider == 'bundled' and platform_postgres_auth.rc != 0
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} exec -T postgres sh /tmp/align-postgres-password.sh check"
+    chdir: "{{ platform_compose_dir }}"
+  changed_when: false
+
+# --remove-orphans keeps containers of services whose profile was switched off
+# (for example cache_provider redis -> memory, or mqtt_provider emqx -> mosquitto),
+# so remove those explicitly. Do it before the stack starts: an old broker still
+# holds the MQTT host ports. Volumes are kept, so switching back keeps the data.
+- name: List services enabled by the current profiles
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} config --services"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_enabled_services
+  changed_when: false
+
+- name: List existing service containers
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} ps --all --services"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_existing_services
+  changed_when: false
+
+- name: Remove containers of disabled services
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} rm --stop --force {{ platform_disabled_services | join(' ') }}"
+    chdir: "{{ platform_compose_dir }}"
+  vars:
+    platform_disabled_services: "{{ platform_existing_services.stdout_lines | difference(platform_enabled_services.stdout_lines) }}"
+  when: platform_disabled_services | length > 0
+  changed_when: true
+
+- name: Start platform stack
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} up -d --remove-orphans --wait --wait-timeout {{ platform_start_timeout_seconds | default(300) }}"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_up
+  changed_when: platform_up.stderr is search('Creat|Recreat|Start(ed|ing)')
+  failed_when: false
+
+- name: Report a failed start with service logs
+  when: platform_up.rc != 0
+  block:
+    - name: Capture service logs
+      ansible.builtin.command:
+        cmd: "{{ platform_compose }} logs --tail=150"
+        chdir: "{{ platform_compose_dir }}"
+      register: platform_logs
+      changed_when: false
+      failed_when: false
+
+    - name: Fail with Compose output and logs
+      ansible.builtin.fail:
+        msg: |
+          docker compose up failed (rc={{ platform_up.rc }}).
+          {{ platform_up.stderr }}
+          service logs:
+          {{ platform_logs.stdout | default('') }}
+
+# The EC2 hop limit is 2 so Traefik (in Docker) can use the instance role for
+# DNS-01. Keep every other container away from the metadata service.
+- name: Install metadata service guard
+  ansible.builtin.copy:
+    src: meteorcloud-imds-guard.sh
+    dest: /usr/local/sbin/meteorcloud-imds-guard
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install metadata service guard units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: meteorcloud-imds-guard.service
+      content: |
+        [Unit]
+        Description=Only Traefik may reach the EC2 metadata service
+        After=docker.service
+        Requires=docker.service
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/meteorcloud-imds-guard {{ compose_project_name }}
+    - name: meteorcloud-imds-guard.timer
+      content: |
+        [Unit]
+        Description=Follow Traefik's address for the metadata service guard
+
+        [Timer]
+        OnBootSec=10s
+        OnUnitActiveSec=15s
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Enable metadata service guard
+  ansible.builtin.systemd:
+    name: meteorcloud-imds-guard.timer
+    enabled: true
+    state: started
+    daemon_reload: true
+
+- name: Apply metadata service guard now
+  ansible.builtin.command: /usr/local/sbin/meteorcloud-imds-guard {{ compose_project_name }}
+  changed_when: false
+
+- name: Install the backup script
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../../scripts/backup.sh"
+    dest: /usr/local/sbin/meteorcloud-backup
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Install the restore script
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../../scripts/restore.sh"
+    dest: /usr/local/sbin/meteorcloud-restore
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write the backup settings
+  ansible.builtin.copy:
+    dest: "{{ platform_root }}/backup.env"
+    owner: root
+    group: root
+    mode: "0600"
+    # systemd EnvironmentFile syntax (double-quoted, C escapes). Do not shell-source this
+    # file: restore via systemd-run --property=EnvironmentFile=… (docs/backups.md).
+    content: |
+      {% macro systemd_env(value) -%}"{{ value | string | replace('\\', '\\\\') | replace('"', '\\"') | replace('\n', '\\n') }}"{%- endmacro %}
+      COMPOSE_DIR={{ systemd_env(platform_compose_dir) }}
+      COMPOSE={{ systemd_env(platform_compose | trim) }}
+      BACKUP_DIR={{ systemd_env(platform_root ~ '/backups') }}
+      BACKUP_LOCK_FILE={{ systemd_env(platform_root ~ '/backups/.lock') }}
+      BACKUP_RETENTION_DAYS={{ systemd_env(backup_retention_days) }}
+      BACKUP_S3_URI={{ systemd_env(backup_s3_uri) }}
+      BACKUP_S3_ENDPOINT_URL={{ systemd_env(backup_s3_endpoint_url) }}
+      AWS_REGION={{ systemd_env(backup_s3_region) }}
+      AWS_ACCESS_KEY_ID={{ systemd_env(backup_s3_access_key_id) }}
+      AWS_SECRET_ACCESS_KEY={{ systemd_env(backup_s3_secret_access_key) }}
+      AWS_SESSION_TOKEN={{ systemd_env(backup_s3_session_token) }}
+  no_log: true
+
+- name: Install the backup units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    owner: root
+    group: root
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: meteorcloud-backup.service
+      content: |
+        [Unit]
+        Description=Back up MeteorCloud (PostgreSQL, ClickHouse, artifacts)
+        After=docker.service
+        Requires=docker.service
+
+        [Service]
+        Type=oneshot
+        EnvironmentFile={{ platform_root }}/backup.env
+        ExecStart=/usr/local/sbin/meteorcloud-backup
+    - name: meteorcloud-backup.timer
+      content: |
+        [Unit]
+        Description=Nightly MeteorCloud backup
+
+        [Timer]
+        OnCalendar={{ backup_on_calendar }}
+        RandomizedDelaySec=10m
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Enable or disable the nightly backup
+  ansible.builtin.systemd:
+    name: meteorcloud-backup.timer
+    enabled: "{{ backup_enabled | bool }}"
+    state: "{{ 'started' if backup_enabled | bool else 'stopped' }}"
+    daemon_reload: true
+
+# Bind-mounted config files are not part of the Compose config hash.
+- name: Restart services whose mounted configuration changed
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} restart {{ item }}"
+    chdir: "{{ platform_compose_dir }}"
+  loop: >-
+    {{ ([mqtt_provider] if mqtt_enabled | bool and mqtt_broker == 'bundled' else [])
+       + (platform_observability_services if observability_enabled | bool else []) }}
+  vars:
+    platform_observability_by_component:
+      metrics: [prometheus, node-exporter]
+      logs: [loki, alloy]
+      alerting: [alertmanager]
+      dashboards: [grafana]
+    platform_observability_services: >-
+      {{ observability_components.split(',') | map('trim') | select
+         | map('extract', platform_observability_by_component) | select('defined') | flatten }}
+  when: >-
+    (platform_service_config is defined and platform_service_config.changed)
+    or (item == mqtt_provider and platform_mqtt_certs is defined and platform_mqtt_certs.changed)
+    or (item == 'alertmanager' and platform_alertmanager_secret is defined and platform_alertmanager_secret.changed)
+    or (item == 'alertmanager' and platform_alertmanager_heartbeat_secret is defined
+        and platform_alertmanager_heartbeat_secret.changed)
+  changed_when: true
+
+- name: Create the initial administrator when configured
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} exec -T backend python -m app.cli create-admin"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_admin
+  changed_when: "'Created administrator' in (platform_admin.stdout + platform_admin.stderr)"
+  when: admin_email | length > 0 and admin_password | length > 0
+
+- name: Seed Demo Organization when configured
+  ansible.builtin.command:
+    cmd: "{{ platform_compose }} exec -T backend python -m app.cli create-demo"
+    chdir: "{{ platform_compose_dir }}"
+  register: platform_demo
+  changed_when: "'Created organization' in (platform_demo.stdout + platform_demo.stderr)"
+  when: (demo_data | default(false) | bool) and admin_email | length > 0

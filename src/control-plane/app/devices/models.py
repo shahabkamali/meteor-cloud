@@ -1,6 +1,9 @@
-"""Fleet domain models: device types, groups, registration tokens, devices.
+"""Device-management domain models: device types, groups, registration tokens, devices.
 
-All fleet resources are strictly organization-scoped. PostgreSQL JSONB is used
+DeviceType = what kind of hardware; Device = which physical device;
+DeviceGroup = how devices are logically organized.
+
+All of these resources are strictly organization-scoped. PostgreSQL JSONB is used
 only for free-form structures (capabilities, labels, MAC address arrays, and
 custom metadata); every other attribute is an explicit column.
 """
@@ -23,17 +26,21 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.models import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class DeviceType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
-    """A named class of Linux device within an organization."""
+    """A hardware model of device (e.g. "Raspberry Pi 4"), not a physical device.
+
+    Artifacts such as OS images are associated with a device type.
+    """
 
     __tablename__ = "device_types"
     __table_args__ = (
         UniqueConstraint("organization_id", "name", name="uq_device_types_org_name"),
+        UniqueConstraint("organization_id", "slug", name="uq_device_types_org_slug"),
         Index("ix_device_types_organization_id", "organization_id"),
     )
 
@@ -43,9 +50,21 @@ class DeviceType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    slug: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manufacturer: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # CPU architecture of the hardware (e.g. "arm64", "armv7", "x86_64").
+    architecture: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Free-form list/dict of declared capabilities.
     capabilities: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
         JSONB,
         nullable=False,
         default=dict,
@@ -54,11 +73,15 @@ class DeviceType(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 
 class DeviceGroup(Base, UUIDPrimaryKeyMixin, TimestampMixin):
-    """A logical grouping of devices within an organization."""
+    """A logical grouping of devices (e.g. "Production"), not a hardware type.
+
+    A device belongs to at most one group.
+    """
 
     __tablename__ = "device_groups"
     __table_args__ = (
         UniqueConstraint("organization_id", "name", name="uq_device_groups_org_name"),
+        UniqueConstraint("organization_id", "slug", name="uq_device_groups_org_slug"),
         Index("ix_device_groups_organization_id", "organization_id"),
     )
 
@@ -68,8 +91,16 @@ class DeviceGroup(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(120), nullable=False)
+    slug: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     labels: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    metadata_: Mapped[dict[str, Any]] = mapped_column(
+        "metadata",
         JSONB,
         nullable=False,
         default=dict,
@@ -135,7 +166,11 @@ class RegistrationToken(Base, UUIDPrimaryKeyMixin, TimestampMixin):
 
 
 class Device(Base, UUIDPrimaryKeyMixin, TimestampMixin):
-    """A registered Linux device belonging to an organization."""
+    """One physical device belonging to an organization.
+
+    ``id`` is the device ID used in APIs and MQTT topics. Connectivity status is
+    derived from ``last_seen_at`` rather than stored.
+    """
 
     __tablename__ = "devices"
     __table_args__ = (
@@ -190,9 +225,15 @@ class Device(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     os_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
     kernel_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
     architecture: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Board model as the device reports it, e.g. "Raspberry Pi 5 Model B Rev 1.0".
+    hardware_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cpu_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cpu_cores: Mapped[int | None] = mapped_column(Integer, nullable=True)
     memory_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # LAN address of the primary physical interface. Not a WireGuard address.
+    local_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # meteorcli version last reported on a heartbeat (X.Y.Z).
+    agent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     labels: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
@@ -220,6 +261,19 @@ class Device(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         nullable=True,
     )
     registered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Until when this hardware may register again without its current device token
+    # (an administrator allowed it, e.g. after re-flashing the card). None = not allowed.
+    reregistration_allowed_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    # Previous credential, kept briefly so a lost register response can be retried
+    # with the old device token (see device_registration_retry_seconds).
+    previous_credential_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    previous_credential_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
     )
@@ -311,6 +365,11 @@ class DeviceEnrollmentRequest(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         ForeignKey("enrollment_api_keys.id", ondelete="SET NULL"),
         nullable=True,
     )
+    enrollment_key: Mapped[EnrollmentApiKey | None] = relationship(
+        EnrollmentApiKey,
+        foreign_keys="DeviceEnrollmentRequest.api_key_id",
+        lazy="joined",
+    )
 
     status: Mapped[str] = mapped_column(
         String(16),
@@ -350,9 +409,12 @@ class DeviceEnrollmentRequest(Base, UUIDPrimaryKeyMixin, TimestampMixin):
     os_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
     kernel_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
     architecture: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Board model as the device reports it, e.g. "Raspberry Pi 5 Model B Rev 1.0".
+    hardware_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cpu_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cpu_cores: Mapped[int | None] = mapped_column(Integer, nullable=True)
     memory_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    local_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     labels: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
@@ -391,6 +453,18 @@ class DeviceEnrollmentRequest(Base, UUIDPrimaryKeyMixin, TimestampMixin):
         DateTime(timezone=True),
         nullable=True,
     )
+
+    @property
+    def enrollment_key_id(self) -> uuid.UUID | None:
+        return self.api_key_id
+
+    @property
+    def enrollment_key_name(self) -> str | None:
+        return self.enrollment_key.name if self.enrollment_key is not None else None
+
+    @property
+    def enrollment_key_prefix(self) -> str | None:
+        return self.enrollment_key.key_prefix if self.enrollment_key is not None else None
 
 
 class DeviceMqttCredential(Base, TimestampMixin):

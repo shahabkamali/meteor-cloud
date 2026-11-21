@@ -15,11 +15,39 @@ Optional body:
 ```json
 {
   "hostname": "edge-01",
-  "os_version": "22.04",
-  "kernel_version": "6.2.0",
-  "metrics": {}
+  "os_name": "Debian GNU/Linux",
+  "os_version": "13",
+  "kernel_version": "6.18.0",
+  "architecture": "aarch64",
+  "serial_number": "10000000abcd1234",
+  "mac_addresses": ["aa:bb:cc:dd:ee:ff"],
+  "hardware_model": "Raspberry Pi 5 Model B Rev 1.0",
+  "cpu_model": "ARM Cortex-A76",
+  "cpu_cores": 4,
+  "memory_mb": 3795,
+  "local_ip": "192.168.1.20",
+  "agent_version": "0.3.4",
+  "metrics": {},
+  "capabilities": { "systemd": true, "docker": true, "docker_compose": true },
+  "software_report": [
+    {
+      "workload_key": "camera-agent.service",
+      "installed_release_id": "…",
+      "installed_version": "1.2.0",
+      "health": "healthy"
+    }
+  ]
 }
 ```
+
+`software_report[].health` is the agent's runtime check, done on the device on
+every heartbeat (the cloud never probes the app): `healthy` means the systemd
+unit is active, or the container (every compose service) is running and its
+Docker `HEALTHCHECK`, if any, passes. `unknown` means a `HEALTHCHECK` is still
+starting. A workload that stops after install stays `in_sync` with
+`health: "unhealthy"` and a short `last_error`; the agent does not reinstall it.
+A container or compose project that no longer exists (e.g. after `docker rm`)
+is re-applied instead.
 
 Response:
 
@@ -28,12 +56,42 @@ Response:
   "device_id": "…",
   "status": "online",
   "heartbeat_interval_seconds": 60,
-  "server_time": "2026-08-18T10:00:00Z"
+  "server_time": "2026-08-18T10:00:00Z",
+  "desired_software": [
+    {
+      "workload_key": "camera-agent.service",
+      "kind": "systemd",
+      "release_id": "…",
+      "release_name": "camera-agent",
+      "release_version": "1.2.0",
+      "artifact_id": "…",
+      "revision": 1,
+      "spec": { "unit_name": "camera-agent.service", "start": true }
+    }
+  ]
 }
 ```
 
-Each heartbeat updates the device's `last_seen_at` and may refresh a few
-inventory fields. Disabled or credential-revoked devices are rejected.
+Each heartbeat updates the device's `last_seen_at` and refreshes inventory
+the agent sends (serial, CPU, local IP, agent version, and the other fields in the body).
+A missing or blank value leaves the stored field unchanged. A serial number or
+MAC address already stored on another device is left unchanged too, so a
+heartbeat cannot copy another device's identity. `local_ip` is the LAN address
+of the primary physical interface (Ethernet, otherwise Wi-Fi). When the agent
+omits it, the server records the private address the heartbeat arrived from.
+A value that is not an IP address is ignored, as are `0.0.0.0`, loopback,
+link-local, and public addresses. `agent_version` is the installed meteorcli
+`X.Y.Z`; the console Overview shows it, and Manage device can order an update
+to the latest release.
+
+`software_report` updates installed software for known
+workloads (unknown keys are ignored). The response includes current
+`desired_software`. Agents can also poll `GET /api/v1/agent/software`.
+When a desired item has an `artifact_id`, the agent downloads it from
+`GET /api/v1/agent/artifacts/{id}/download` (only if that artifact is on current
+desired software) and reports `updating` / `failed` as needed. See
+[Deployments](deployments.md). Disabled or credential-revoked devices are
+rejected.
 
 ## Connectivity status
 
@@ -57,9 +115,21 @@ heartbeat does not immediately flip a device offline.
 ## Reference agent
 
 ```bash
-meteorcli run          # loop using the advertised interval
+systemctl status meteorcli   # started by a root install; heartbeats once registered
+journalctl -u meteorcli -f
+meteorcli run          # foreground loop; Ctrl+C to stop
 meteorcli run --once   # single heartbeat
 ```
 
+`meteorcli run` stays in the terminal and logs each heartbeat plus WireGuard
+status. It is not a background daemon. If `meteorcli.service` is already
+running, `meteorcli run` exits so heartbeats, MQTT, and WireGuard are not
+duplicated (`--once` is still allowed).
+
 The loop uses bounded exponential backoff on transient failures and stops if the
 credential is rejected so the device can be re-registered.
+
+## Work waiting for the device
+
+The heartbeat response includes `wifi_pending`. When it is true the agent fetches
+the waiting [Wi-Fi change](wifi.md) and reports the outcome.

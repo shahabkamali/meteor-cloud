@@ -6,7 +6,18 @@ export function slugify(value: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
+export type OrganizationRole = "owner" | "admin" | "operator" | "developer" | "viewer";
+
 export function canManageMembers(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** Teams group members; they grant no permissions. */
+export function canReadTeams(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "operator" || role === "developer";
+}
+
+export function canManageTeams(role: string | undefined): boolean {
   return role === "owner" || role === "admin";
 }
 
@@ -18,18 +29,123 @@ export function canDeleteOrganization(role: string | undefined): boolean {
   return role === "owner";
 }
 
+/** Device operate / enroll. Prefer /me/access when available. */
 export function canManageFleet(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "operator";
+}
+
+export function canDeleteDevices(role: string | undefined): boolean {
   return role === "owner" || role === "admin";
 }
 
-export function assignableRoles(
-  actorRole: string | undefined,
-): Array<"owner" | "admin" | "member" | "viewer"> {
+export function canManageArtifacts(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "developer";
+}
+
+/** Show OS images in Meteor Imager (artifact.publish): public downloads, so owners and admins only. */
+export function canPublishOsImages(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** Start or cancel Deploy actions. Prefer /me/access when available. */
+export function canManageDeployments(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "operator" || role === "developer";
+}
+
+export function canManageEndpoints(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "operator" || role === "developer";
+}
+
+/** Browser SSH is root-capable, so only owners and admins. Prefer /me/access when available. */
+export function canOpenDeviceShell(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** See and change a device's Wi-Fi and connection (device.network): sensitive, so owners and admins only. */
+export function canManageDeviceWifi(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** Restart or shut down a device (device.reboot): owners and admins only. */
+export function canRebootDevice(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** Order meteorcli to install the latest release (device.update_agent): owners and admins only. */
+export function canUpdateDeviceAgent(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** Change SSH passwords or add SSH users (device.users): as sensitive as a shell. */
+export function canManageDeviceUsers(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+/** Read device logs (device.logs): everyone but viewers. */
+export function canViewDeviceLogs(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "operator" || role === "developer";
+}
+
+/** Rollback a finished Deploy (owner/admin only). */
+export function canRollbackDeployments(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+export function canManageDeviceTypes(role: string | undefined): boolean {
+  return role === "owner" || role === "admin" || role === "developer";
+}
+
+export function canManageDeviceGroups(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+export function canManageEnrollmentKeys(role: string | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+export function assignableRoles(actorRole: string | undefined): OrganizationRole[] {
   if (actorRole === "owner") {
-    return ["owner", "admin", "member", "viewer"];
+    return ["owner", "admin", "operator", "developer", "viewer"];
   }
   if (actorRole === "admin") {
-    return ["member", "viewer"];
+    return ["operator", "developer", "viewer"];
   }
   return [];
+}
+
+export function roleLabel(role: string | undefined): string {
+  switch (role) {
+    case "owner":
+      return "Owner";
+    case "admin":
+      return "Admin";
+    case "operator":
+      return "Operator";
+    case "developer":
+      return "Developer";
+    case "viewer":
+      return "Viewer";
+    case "member":
+      return "Operator";
+    default:
+      return role ?? "—";
+  }
+}
+
+export function roleDescription(role: string | undefined): string {
+  switch (role) {
+    case "owner":
+      return "Full control, including deleting the organization and assigning other owners.";
+    case "admin":
+      return "Manages people and day-to-day operations. Cannot delete the organization.";
+    case "operator":
+    case "member":
+      return "Runs devices and deployments in the places you assign. Cannot manage people.";
+    case "developer":
+      return "Manages device types, artifacts, and deployments. Limited control of live devices.";
+    case "viewer":
+      return "Can look around. Cannot change devices, people, or settings.";
+    default:
+      return "";
+  }
 }

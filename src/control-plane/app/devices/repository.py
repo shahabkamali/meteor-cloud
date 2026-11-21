@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import Select, String, asc, cast, desc, func, or_, select
+from sqlalchemy import Row, Select, String, asc, cast, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.devices.models import (
@@ -23,6 +23,20 @@ from app.devices.models import (
     EnrollmentApiKey,
     RegistrationToken,
 )
+
+
+def _device_counts(session: Session, organization_id: uuid.UUID, column) -> dict[uuid.UUID, int]:
+    """Count assigned devices per value of a Device classification column.
+
+    Restrict counts to the organization and omit null assignments and
+    classifications with no devices.
+    """
+    statement = (
+        select(column, func.count())
+        .where(Device.organization_id == organization_id, column.is_not(None))
+        .group_by(column)
+    )
+    return {key: int(count) for key, count in session.execute(statement).all()}
 
 
 class DeviceTypeRepository:
@@ -43,11 +57,23 @@ class DeviceTypeRepository:
         )
         return self.session.scalar(statement)
 
+    def get_by_slug(self, *, organization_id: uuid.UUID, slug: str) -> DeviceType | None:
+        """Return the type matching the exact slug in the organization, or None."""
+        statement = select(DeviceType).where(
+            DeviceType.organization_id == organization_id,
+            DeviceType.slug == slug,
+        )
+        return self.session.scalar(statement)
+
     def list(self, *, organization_id: uuid.UUID) -> list[DeviceType]:
         statement = (
             select(DeviceType).where(DeviceType.organization_id == organization_id).order_by(DeviceType.name.asc())
         )
         return list(self.session.scalars(statement).all())
+
+    def device_counts(self, *, organization_id: uuid.UUID) -> dict[uuid.UUID, int]:
+        """Return assigned device counts by type, omitting types with no devices."""
+        return _device_counts(self.session, organization_id, Device.device_type_id)
 
     def create(self, device_type: DeviceType) -> DeviceType:
         self.session.add(device_type)
@@ -93,11 +119,23 @@ class DeviceGroupRepository:
         )
         return self.session.scalar(statement)
 
+    def get_by_slug(self, *, organization_id: uuid.UUID, slug: str) -> DeviceGroup | None:
+        """Return the group matching the exact slug in the organization, or None."""
+        statement = select(DeviceGroup).where(
+            DeviceGroup.organization_id == organization_id,
+            DeviceGroup.slug == slug,
+        )
+        return self.session.scalar(statement)
+
     def list(self, *, organization_id: uuid.UUID) -> list[DeviceGroup]:
         statement = (
             select(DeviceGroup).where(DeviceGroup.organization_id == organization_id).order_by(DeviceGroup.name.asc())
         )
         return list(self.session.scalars(statement).all())
+
+    def device_counts(self, *, organization_id: uuid.UUID) -> dict[uuid.UUID, int]:
+        """Return assigned device counts by group, omitting groups with no devices."""
+        return _device_counts(self.session, organization_id, Device.device_group_id)
 
     def create(self, group: DeviceGroup) -> DeviceGroup:
         self.session.add(group)
@@ -176,16 +214,34 @@ class DeviceRepository:
         statement = select(Device).where(Device.credential_hash == credential_hash)
         return self.session.scalar(statement)
 
+    def lock_names(self, *, organization_id: uuid.UUID) -> None:
+        """Until commit, stop another transaction choosing a name in this organization (same key as enrollment)."""
+        self.session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(str(organization_id), 0))))
+
+    def taken_names(self, *, organization_id: uuid.UUID) -> set[str]:
+        """Casefolded names of the organization's devices."""
+        names = self.session.scalars(select(Device.name).where(Device.organization_id == organization_id))
+        return {name.casefold() for name in names}
+
+    def list_identities(self, *, organization_id: uuid.UUID) -> list[Row]:
+        """Each device's id, name, serial and MACs, without loading whole rows."""
+        statement = select(Device.id, Device.name, Device.serial_number, Device.mac_addresses).where(
+            Device.organization_id == organization_id
+        )
+        return list(self.session.execute(statement).all())
+
     def list_candidates_for_identity(
         self,
         *,
         serial_number: str | None,
         mac_addresses: Sequence[str],
+        for_update: bool = False,
     ) -> list[Device]:
         """Return devices that could match an incoming identity (any org).
 
         Cross-organization candidates are included so the caller can reject
-        registrations that collide with another tenant.
+        registrations that collide with another tenant. ``for_update`` locks the
+        rows so concurrent re-registrations cannot both pass the same window.
         """
         conditions = []
         if serial_number:
@@ -195,6 +251,8 @@ class DeviceRepository:
         if not conditions:
             return []
         statement = select(Device).where(or_(*conditions))
+        if for_update:
+            statement = statement.with_for_update().execution_options(populate_existing=True)
         return list(self.session.scalars(statement).all())
 
     def create(self, device: Device) -> Device:
@@ -216,6 +274,7 @@ class DeviceRepository:
         *,
         organization_id: uuid.UUID,
         search: str | None,
+        name: str | None = None,
         device_type_id: uuid.UUID | None,
         device_group_id: uuid.UUID | None,
         architecture: str | None,
@@ -224,6 +283,8 @@ class DeviceRepository:
         status: str | None,
     ) -> Select:
         statement = select(Device).where(Device.organization_id == organization_id)
+        if name:
+            statement = statement.where(func.lower(Device.name) == name.lower())
         if search:
             pattern = f"%{search.lower()}%"
             statement = statement.where(
@@ -258,20 +319,24 @@ class DeviceRepository:
         *,
         organization_id: uuid.UUID,
         search: str | None = None,
+        name: str | None = None,
         device_type_id: uuid.UUID | None = None,
         device_group_id: uuid.UUID | None = None,
+        allowed_group_ids: list[uuid.UUID] | None = None,
         architecture: str | None = None,
         enabled: bool | None = None,
         status: str | None = None,
         online_cutoff: datetime | None = None,
-        sort: str = "name",
-        order: str = "asc",
+        sort: str = "last_seen_at",
+        order: str = "desc",
         page: int = 1,
         page_size: int = 20,
     ) -> tuple[list[Device], int]:
+        """``allowed_group_ids`` limits results to those groups (and excludes ungrouped devices)."""
         statement = self._base_query(
             organization_id=organization_id,
             search=search,
+            name=name,
             device_type_id=device_type_id,
             device_group_id=device_group_id,
             architecture=architecture,
@@ -279,6 +344,8 @@ class DeviceRepository:
             online_cutoff=online_cutoff,
             status=status,
         )
+        if allowed_group_ids is not None:
+            statement = statement.where(Device.device_group_id.in_(allowed_group_ids))
 
         count_statement = select(func.count()).select_from(statement.subquery())
         total = int(self.session.scalar(count_statement) or 0)
@@ -288,9 +355,13 @@ class DeviceRepository:
             "last_seen_at": Device.last_seen_at,
             "created_at": Device.created_at,
             "registered_at": Device.registered_at,
-        }.get(sort, Device.name)
+        }.get(sort, Device.last_seen_at)
         direction = desc if order == "desc" else asc
-        statement = statement.order_by(direction(sort_column), Device.id.asc())
+        # Never-seen devices (null last_seen_at) stay at the end when sorting by activity.
+        ordered = direction(sort_column)
+        if sort_column is Device.last_seen_at:
+            ordered = ordered.nulls_last()
+        statement = statement.order_by(ordered, Device.id.asc())
         statement = statement.offset((page - 1) * page_size).limit(page_size)
 
         devices = list(self.session.scalars(statement).all())
@@ -358,7 +429,33 @@ class DeviceEnrollmentRequestRepository:
         if status is not None:
             statement = statement.where(DeviceEnrollmentRequest.status == status)
         statement = statement.order_by(DeviceEnrollmentRequest.created_at.desc())
-        return list(self.session.scalars(statement).all())
+        return list(self.session.scalars(statement).unique().all())
+
+    def list_active_unclaimed(self, *, organization_id: uuid.UUID) -> list[DeviceEnrollmentRequest]:
+        """Pending or approved requests that have not yet claimed a device token."""
+        statement = (
+            select(DeviceEnrollmentRequest)
+            .where(
+                DeviceEnrollmentRequest.organization_id == organization_id,
+                DeviceEnrollmentRequest.claimed_at.is_(None),
+                DeviceEnrollmentRequest.status.in_(("pending", "approved")),
+            )
+            .order_by(DeviceEnrollmentRequest.created_at.asc())
+        )
+        return list(self.session.scalars(statement).unique().all())
+
+    def count_pending_for_key(self, *, api_key_id: uuid.UUID, now: datetime) -> int:
+        """Pending, unexpired requests submitted with one enrollment key."""
+        statement = (
+            select(func.count())
+            .select_from(DeviceEnrollmentRequest)
+            .where(
+                DeviceEnrollmentRequest.api_key_id == api_key_id,
+                DeviceEnrollmentRequest.status == "pending",
+                or_(DeviceEnrollmentRequest.expires_at.is_(None), DeviceEnrollmentRequest.expires_at > now),
+            )
+        )
+        return int(self.session.scalar(statement) or 0)
 
     def create(self, request: DeviceEnrollmentRequest) -> DeviceEnrollmentRequest:
         self.session.add(request)

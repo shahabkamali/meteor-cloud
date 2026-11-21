@@ -5,14 +5,18 @@ Deploy modular services to a single AWS EC2 instance with one command.
 ## Quick start
 
 ```bash
-export EDGE_PLATFORM_POSTGRES_PASSWORD='...'
-export EDGE_PLATFORM_JWT_SECRET='...'
-
 # Edit installation.yaml — services, region, SSH key, etc.
-make up
+make aws-up
 ```
 
-Equivalent: `edge-installer apply installation.yaml`
+`make aws-up` generates Postgres, JWT, and connectivity secrets when they are
+unset, prints them at the end, and saves them at `~/.meteorcloud/secrets.env`.
+Re-runs reuse that file. Override any value by exporting it first.
+
+Equivalent: `edge-installer apply installation.yaml` (that path still requires
+the env vars; use `make aws-up` to generate them).
+
+This is the **create a new EC2** path only (`make aws-up`: Terraform creates the host, Ansible deploys Compose). If you already have the VM, clone the repo on it and run `make up` ([Install quickstart](install-quickstart.md)). Kubernetes uses Helm ([kubernetes.md](kubernetes.md)). To smoke-test a throwaway instance from GitHub Actions, see [EC2 smoke test](aws-ci.md).
 
 ## Configure services
 
@@ -34,12 +38,12 @@ See [Modular services](services.md) for details and adding new services.
 By default the installer clones and builds from:
 
 ```text
-https://github.com/shahabkamali/MeteorCloud.git
+https://github.com/meteor-edge/meteor-cloud.git
 ```
 
 ```yaml
 deployment:
-  repository_url: https://github.com/shahabkamali/MeteorCloud.git
+  repository_url: https://github.com/meteor-edge/meteor-cloud.git
   git_ref: master
   image_source: git
   backend_image: edge-platform-backend:0.2.0
@@ -47,13 +51,13 @@ deployment:
   image_pull_policy: never
 ```
 
-Registry-based deploy:
+Registry-based deploy with the signed release images (see [release-images.md](release-images.md)):
 
 ```yaml
 deployment:
   image_source: registry
-  backend_image: ghcr.io/example/edge-platform-backend:0.2.0
-  frontend_image: ghcr.io/example/edge-platform-frontend:0.2.0
+  backend_image: ghcr.io/meteor-edge/meteorcloud-backend:0.2.0
+  frontend_image: ghcr.io/meteor-edge/meteorcloud-console:0.2.0
   image_pull_policy: always
 ```
 
@@ -64,22 +68,22 @@ Push app changes to GitHub before deploy when using `image_source: git`.
 ```bash
 edge-installer validate installation.yaml
 make plan                              # or edge-installer plan
-make up                                # or edge-installer apply
+make aws-up                            # or edge-installer apply
 make status-aws                        # or edge-installer status
 edge-installer upgrade installation.yaml
-make down                              # or edge-installer destroy --yes
+make aws-down                          # or edge-installer destroy --yes
 ```
 
-## What `apply` / `make up` does
+## What `apply` / `make aws-up` does
 
 1. Validates configuration and secrets
-2. Runs Terraform for **enabled services** (EC2, SG, EIP, VPN rules)
-3. Waits for SSH
+2. Runs Terraform for **enabled services** (EC2, SG, EIP, VPN rules; a second EC2 + SG + EIP for the WireGuard gateway with `services.vpn.placement: dedicated`)
+3. Waits for SSH (on the gateway too)
 4. Ansible `site.yml`:
    - **provision** — Docker, directories (shared)
    - **deploy** — each enabled service playbook
-5. For `cloud_app`: clone repo, build images, start Compose, migrations, optional admin
-6. For `vpn`: install WireGuard (active when `EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY` is set)
+5. For `cloud_app`: copy `deploy/compose/` to `/opt/edge-platform/compose`, render `.env`, clone the repo and build images (or pull from a registry), `docker compose up --wait` (the API runs migrations on start), optional first admin
+6. For `vpn` (runs before `cloud_app`): install WireGuard on the gateway (the app host, or the dedicated instance), generate its key, start `wg-quick@wg0` and the peer agent, and set `CONNECTIVITY_PROVIDER=wireguard` in the API's `.env`. A dedicated gateway also gets a site link (`wg-link`) from the API host. See [Device connectivity](fleet/connectivity.md).
 7. Health check (cloud_app only)
 
 ## Expected success output
@@ -100,19 +104,21 @@ Platform URL: http://18.198.10.20
 
 ```text
 Internet -> Traefik -> /api, /health -> Backend
-                     -> /           -> Frontend
-PostgreSQL and Redis: internal Docker network only
-VPN (optional): UDP 51820 -> WireGuard on host
+                     -> /           -> Console
+PostgreSQL (and Redis, if enabled): internal Docker network only
+Artifacts: /opt/edge-platform/data/artifacts (filesystem storage)
+VPN (optional): UDP 51820 -> WireGuard on the host, or on the dedicated gateway instance (placement: dedicated)
 ```
 
 ## Limitations
 
-- Single EC2 instance
+- Single EC2 instance (for clusters use the [Helm chart](kubernetes.md))
 - Local Terraform state
-- VPN shares the cloud_app host
-- No automatic DNS management
+- VPN defaults to the cloud_app host (`services.vpn.placement: same_host`; use `dedicated` for a second EC2)
 - No zero-downtime upgrades
 - Git builds on EC2 (slower than registry pulls)
+
+With the example `installation.yaml`, `cloud_app`, bundled MQTT (EMQX on TCP 8883), and WireGuard (UDP 51820) are enabled. `ARGS='--route53'` creates/updates `<domain>`, `*.<domain>`, and `wg.<domain>` (existing A records for those names are overwritten).
 
 ## Related docs
 

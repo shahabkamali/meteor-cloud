@@ -1,8 +1,12 @@
 # Development Guide
 
+Laptop testing and contributor workflow (`make dev`). Production on a VM is
+`make up` ([Install quickstart](install-quickstart.md)), not this page.
+
 ## Prerequisites
 
-- Docker and Docker Compose
+- Docker and Docker Compose v2.24+
+- Optional, for Kubernetes: k3d, kubectl, helm
 - Python 3.13+
 - Node.js 22+
 - Make
@@ -10,7 +14,7 @@
 ## First-time setup
 
 ```bash
-cp .env.example .env
+cp deploy/compose/.env.example deploy/compose/.env
 
 python -m venv .venv
 source .venv/bin/activate
@@ -18,18 +22,18 @@ source .venv/bin/activate
 make install
 ```
 
-`make install` installs control-plane, data-plane, installer, agent, and console dependencies. The public website is not in this tree; clone `meteor-ui` for that app.
+`make install` installs control-plane, data-plane, installer, agent, and console dependencies.
+
+For a product walkthrough (console + first device), start with [Getting started](getting-started.md).
 
 ## Running the stack
 
 ```bash
 make dev                 # all Compose files (shared network meteorcloud)
-make dev-control-plane   # postgres, redis, control-plane API
-make dev-data-plane      # EMQX + data-plane MQTT gateway
+make dev-control-plane   # bundled infra (postgres/redis/minio profiles) + control-plane API
+make dev-data-plane      # MQTT broker + data-plane MQTT forwarder (Go)
 make dev-console         # operator console
 ```
-
-Public website: clone `meteor-ui` and run `make dev-website` there.
 
 Together this starts:
 
@@ -38,20 +42,26 @@ Together this starts:
 | Console | http://localhost:5173 |
 | Control plane | http://localhost:8000 |
 | Data plane health | http://localhost:8081/health |
+| Application data API | http://localhost:8082/healthz ([contract](../contracts/data-plane-v1.md)) |
 | OpenAPI | http://localhost:8000/docs |
 | PostgreSQL | localhost:5432 |
 | MQTT TLS | mqtts://localhost:8883 |
-| EMQX dashboard | http://localhost:18083 (development only) |
 | Redis | internal Docker network |
 
 Compose files:
 
 | File | Services |
 | --- | --- |
-| `compose/control-plane.yml` | `postgres`, `redis`, `backend` |
-| `compose/data-plane.yml` | `emqx`, `data-plane` |
-| `compose/console.yml` | `console` |
-| `docker-compose.yml` | `include:` of those three |
+| `deploy/compose/control-plane.yml` | `backend`; profiles `postgres`, `redis`, `minio` |
+| `deploy/compose/data-plane.yml` | profiles `mqtt` (`data-plane`), one of `mosquitto`, `emqx`, `vernemq`, and `data-api` (Go application data plane) |
+| `deploy/compose/console.yml` | `console` (Vite dev server) |
+| `deploy/compose/docker-compose.yml` | `include:` of those three |
+| `deploy/compose/docker-compose.dev.yml` | Source mounts and hot reload (`make dev`). Console runs `npm install` on start so new packages (for example `@xterm/*`) land in the container `node_modules` volume |
+| `deploy/compose/docker-compose.prod.yml` | Production overlay: Traefik, restart policies, no internal ports |
+
+`COMPOSE_PROFILES` in `deploy/compose/.env` selects the bundled services. Remove a
+profile and point the matching setting (`DATABASE_URL`, `REDIS_URL`,
+`OBJECT_STORAGE_ENDPOINT_URL`, `MQTT_BROKER_HOST`) at an external service instead.
 
 Same machine stacks **must** use network name `meteorcloud`.
 
@@ -64,12 +74,14 @@ Same machine stacks **must** use network name `meteorcloud`.
 
 Telemetry is **PostgreSQL last-value** on `Device` (`TELEMETRY_PROVIDER=postgresql`). Timescale and ClickHouse are reserved names and fail fast.
 
-Website content lives in `meteor-ui` under `website/content`. Marketing copy is JSON (`content/site.json`); docs are Markdown. Production uses `WEBSITE_CONTENT_SOURCE=s3` (JSON + `.md` + images on object storage), not control-plane Postgres. `/admin` edits that file set.
+Add `OBS=1` (`make dev OBS=1`) to also start Prometheus, Loki and Grafana; see
+[Observability](observability.md).
 
 Stop with:
 
 ```bash
-make stop
+make stop                 # unified + split Compose projects
+make down                 # same as stop when there is no selfhost inventory
 make stop-control-plane
 make stop-data-plane
 make stop-console
@@ -109,11 +121,7 @@ cd console
 npm run dev
 ```
 
-The browser talks only to the control-plane API (`VITE_API_BASE_URL`).
-
-### Website
-
-Clone [`meteor-edge/meteor-ui`](https://github.com/meteor-edge/meteor-ui) and run `make dev-website` there. That app is not a directory in this repo.
+The browser talks only to the control-plane API (`VITE_API_BASE_URL`). See [Console](console.md).
 
 ### Installer
 
@@ -128,10 +136,26 @@ edge-installer validate --config config/examples/installation.yaml
 make test
 make backend-test
 make data-plane-test
+make data-api-test       # Go data plane: go vet + go test -race (set DATAPLANE_TEST_DATABASE_URL for the PostgreSQL suite)
+make sdk-test            # Python SDK against the real data plane binary (needs Go)
+make agent-test
+make agent-contract-test # Python meteorcli against contracts/device-agent-v1.md (needs Docker for Mosquitto)
 make console-test
+make check-plane-imports
 ```
 
-Runs:
+Deployment checks (the same ones CI runs):
+
+```bash
+make compose-config    # docker compose config for base, dev, prod, observability
+make compose-smoke     # minimal production stack + scripts/smoke_test.py (make images first)
+make helm-lint         # helm lint + template for every values file
+make terraform-check   # fmt, init -backend=false, validate (no credentials)
+make ansible-check ansible-lint
+./scripts/k8s-smoke.sh # throwaway k3d cluster: helm install, test, uninstall, delete
+```
+
+`make test` runs:
 
 1. Installer Pytest suite
 2. Control-plane Pytest suite (requires PostgreSQL; use `make dev` first)
@@ -148,6 +172,14 @@ make migrate
 make seed
 ```
 
+`make seed` is safe to rerun. It creates the development users and organization, plus a small
+demo fleet with device types, groups, and online/offline/never-seen devices. It also uploads
+demo artifacts and creates good/fail releases for systemd, Docker, and Compose so you can
+exercise Deploy, health, and rollback locally (see [Getting started](getting-started.md)).
+Host seed loads `deploy/compose/.env` and talks to MinIO/Postgres on `127.0.0.1` (not
+Docker DNS or AWS). If a release fails with `artifact_content_missing`, re-run `make seed`
+so missing object bytes are restored.
+
 See [Identity and organizations](identity-and-organizations.md) for auth and tenant details.
 
 ## Lint and format
@@ -159,7 +191,7 @@ make format
 
 ## Environment variables
 
-Copy `.env.example` to `.env` and adjust as needed. Important values:
+Copy `deploy/compose/.env.example` to `deploy/compose/.env` and adjust as needed. Values are written from the containers' point of view (service names, not `localhost`). Important values:
 
 | Variable | Purpose |
 | --- | --- |
@@ -167,16 +199,22 @@ Copy `.env.example` to `.env` and adjust as needed. Important values:
 | `TEST_DATABASE_URL` | Optional pytest database (must end in `_test`) |
 | `JWT_SECRET_KEY` | Signing key for JWT utilities |
 | `BACKEND_CORS_ORIGINS` | Allowed browser origins |
-| `VITE_DOCS_BASE_URL` | Console → public docs site (`/docs`) |
-| `SITE_URL` | Public website origin (canonical URLs, sitemap) |
-| `WEBSITE_CONTENT_SOURCE` | Website content: `filesystem` (local JSON + Markdown) or `s3` (JSON file + docs + images on object storage) |
+| `VITE_API_BASE_URL` | Console → control-plane origin |
+| `VITE_DOCS_BASE_URL` | Console → product docs URL |
 | `DATA_PLANE_URL` | Control plane → data-plane HTTP API |
+| `DATA_PLANE_API_URL` | Where the control plane reaches the data API's private listener to send operator commands, for example `http://data-api:8092`. Empty: operator commands answer 503 |
+| `DATA_PLANE_PUBLIC_URL` | Address applications use as `METEORCLOUD_ENDPOINT`, for example `https://cloud.example.com`. Devices must be able to reach it. Empty: the agent cannot hand a bound release its endpoint |
+| `DATA_PLANE_INTERNAL_TOKEN` | Shared secret between the control plane and the data API (policy feed and operator commands). Same value on both. Empty: the policy feed refuses everyone and the data API does not start |
 | `CONTROL_PLANE_URL` | Data plane → control-plane ingest/auth origin |
 | `TELEMETRY_PROVIDER` | Last-value store (`postgresql` only; timescale/clickhouse reserved) |
 | `DATABASE_PROVIDER` | Persistence adapter (`postgresql` only) |
-| `CACHE_PROVIDER` | Rate-limit adapter (`redis` only) |
-| `MQTT_PROVIDER` | MQTT adapter (`emqx` only) |
-| `OTA_PROVIDER` | OTA adapter (`none` until a provider exists) |
+| `CACHE_PROVIDER` | Rate-limit adapter: `redis` (shared) or `memory` (per process) |
+| `OBJECT_STORAGE_PROVIDER` | Artifacts: `s3` (any S3-compatible API) or `filesystem` (`OBJECT_STORAGE_PATH`) |
+| `MQTT_PROVIDER` | Broker adapter: `mosquitto` (default), `emqx`, `vernemq` |
+| `DEPLOYMENT_PROVIDER` | Who *executes* Deploys: `native` (default), `none`, or `mender` (stub until adapter exists). Releases/UI stay in MeteorCloud |
+| `OTA_PROVIDER` | Deprecated; prefer `DEPLOYMENT_PROVIDER` |
+| `DEPLOY_TICK_INTERVAL_SECONDS` | Seconds between background Deploy sweeps (batched delays, phased soak, pending timeouts). Default `60`; `0` disables |
+| `IDENTITY_PROVIDER` | Member sign-in account directory (`local` only: PostgreSQL users) |
 
 HTTP JSON between planes is documented in [`contracts/mqtt-http.md`](../contracts/mqtt-http.md).
 
@@ -195,12 +233,18 @@ HTTP JSON between planes is documented in [`contracts/mqtt-http.md`](../contract
 2. Register it in the installer service registry
 3. Wire enablement through configuration models
 
-## Kubernetes later
+## Local Kubernetes
 
-Do not add manifests in this repo yet. A later split would be Deployments:
-`control-plane`, `data-plane`, and `console`. Scale the API and console independently. The public website is a separate deploy from private `meteor-ui`.
-Keep the data-plane MQTT consumer at 1 until shared subscriptions / a consumer group exist.
-`infrastructure/kubernetes` stays empty.
+```bash
+make k8s-up        # k3d cluster (development tool only)
+make k8s-deploy    # build images, import, helm upgrade --install with values-dev.yaml
+make k8s-status
+make k8s-test
+make k8s-down
+```
+
+The console and API are at http://localhost:8088, MQTT TLS at localhost:18883 (CA in
+`.k8s/certs/ca.crt`). See [Kubernetes](kubernetes.md).
 
 ## Coding standards
 

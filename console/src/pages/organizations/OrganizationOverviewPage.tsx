@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 
 import { getOrganization } from "@/api/organizations";
 import { useAuth } from "@/auth/AuthContext";
+import { FleetOnlineChart } from "@/components/fleet/FleetOnlineChart";
 import { Button } from "@/components/ui/button";
 import { canManageMembers, canUpdateOrganization } from "@/lib/permissions";
 import { formatDateTime } from "@/lib/utils";
@@ -22,7 +23,11 @@ export function OrganizationOverviewPage() {
   }
 
   if (orgQuery.isError || !orgQuery.data) {
-    return <p className="text-red-700">Organization was not found.</p>;
+    return (
+      <p className="bg-ember text-midnight hover:bg-ember hover:text-midnight">
+        Organization was not found.
+      </p>
+    );
   }
 
   const organization = orgQuery.data;
@@ -36,7 +41,7 @@ export function OrganizationOverviewPage() {
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" asChild>
-            <Link to={`/organizations/${organization.id}/devices`}>Fleet</Link>
+            <Link to={`/organizations/${organization.id}/devices`}>Devices</Link>
           </Button>
           <Button variant="secondary" asChild>
             <Link to={`/organizations/${organization.id}/members`}>Members</Link>
@@ -49,7 +54,7 @@ export function OrganizationOverviewPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 rounded-lg border border-border bg-white/80 p-6 shadow-sm sm:grid-cols-2">
+      <div className="grid gap-4 rounded-lg border border-border bg-card p-6 shadow-glow sm:grid-cols-2">
         <div>
           <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Your role
@@ -77,6 +82,8 @@ export function OrganizationOverviewPage() {
           <p className="mt-1 text-sm">{formatDateTime(organization.created_at)}</p>
         </div>
       </div>
+
+      {token ? <FleetOnlineChart token={token} organizationId={organization.id} /> : null}
 
       {canManageMembers(organization.current_user_role) && (
         <p className="text-sm text-muted-foreground">

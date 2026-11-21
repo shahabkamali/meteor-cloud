@@ -1,0 +1,752 @@
+import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  createDeployment,
+  listDeviceGroups,
+  listEndpoints,
+  listDevices,
+  listReleases,
+  type DeploymentCreatePayload,
+  type Release,
+  type RolloutPhase,
+} from "@/api/fleet";
+import { ApiError } from "@/api/http";
+import { AppAddressPicker } from "@/components/fleet/AppAddressPicker";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  checkEndpointPort,
+  existingEndpointFor,
+  suggestedEndpointPort,
+} from "@/components/deployments/ports";
+import { parseYamlObject, toYaml } from "@/lib/yaml";
+
+const KIND_LABELS: Record<string, string> = {
+  systemd: "systemd service",
+  docker: "Single container",
+  docker_compose: "Compose application",
+};
+
+const KIND_CAPABILITY: Record<string, string> = {
+  systemd: "systemd",
+  docker: "docker",
+  docker_compose: "docker_compose",
+};
+
+type Strategy = "immediate" | "batched" | "phased";
+
+const STRATEGIES: { value: Strategy; label: string; hint: string }[] = [
+  {
+    value: "immediate",
+    label: "Immediate",
+    hint: "All selected devices get the release at once. Fastest, but a bad release hits every device together.",
+  },
+  {
+    value: "batched",
+    label: "Batched",
+    hint: "Opens a fixed number of devices at a time; the next batch starts when the current one finishes. Use for paced waves without a failure budget.",
+  },
+  {
+    value: "phased",
+    label: "Phased",
+    hint: "Canary first, then larger shares after a soak delay. Pauses automatically if too many fail. Prefer for production fleets.",
+  },
+];
+
+const PHASED_PRESETS: Record<string, { label: string; hint: string; phases: RolloutPhase[] }> = {
+  canary: {
+    label: "Canary 1, then all",
+    hint: "One device installs first. If it succeeds, every other device follows after a 1 hour soak. Good for small fleets (up to ~10 devices).",
+    phases: [{ count: 1 }, { percent: 100, delay_seconds: 3600 }],
+  },
+  tiered: {
+    label: "1 / 10% / 100%",
+    hint: "One canary device, then 10% of the targets after a 1 hour soak, then everyone after another 24 hours. Each step only starts if the failure % stays under the limit. Good for 10+ devices.",
+    phases: [
+      { count: 1 },
+      { percent: 10, delay_seconds: 3600 },
+      { percent: 100, delay_seconds: 86400 },
+    ],
+  },
+};
+
+const DEFAULT_BATCH_SIZE = "5";
+// Only binds when a phase holds more devices than this; caps parallel artifact downloads.
+const DEFAULT_MAX_CONCURRENT = "50";
+
+const NUMBER_OR_NULL = (value: unknown): number | null => {
+  if (value == null) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Expected a number, got ${JSON.stringify(value)}.`);
+  }
+  return parsed;
+};
+
+type DeployWizardProps = {
+  token: string;
+  organizationId: string;
+  initialReleaseId?: string | null;
+  initialDeviceId?: string | null;
+  onClose: () => void;
+  onCreated: (deploymentId: string) => void;
+};
+
+export function DeployWizard({
+  token,
+  organizationId,
+  initialReleaseId = null,
+  initialDeviceId = null,
+  onClose,
+  onCreated,
+}: DeployWizardProps) {
+  const [mode, setMode] = useState<"wizard" | "yaml">("wizard");
+  const [step, setStep] = useState(1);
+  const [releaseId, setReleaseId] = useState(initialReleaseId ?? "");
+  const [deviceIds, setDeviceIds] = useState<string[]>(initialDeviceId ? [initialDeviceId] : []);
+  const [groupIds, setGroupIds] = useState<string[]>([]);
+  const [name, setName] = useState("");
+  const [strategy, setStrategy] = useState<Strategy>("immediate");
+  const [batchSize, setBatchSize] = useState(DEFAULT_BATCH_SIZE);
+  const [preset, setPreset] = useState("canary");
+  const [failureThreshold, setFailureThreshold] = useState("10");
+  const [maxConcurrent, setMaxConcurrent] = useState(DEFAULT_MAX_CONCURRENT);
+  const [pendingTimeout, setPendingTimeout] = useState("86400");
+  const [force, setForce] = useState(false);
+  const [publish, setPublish] = useState(false);
+  const [endpointHostname, setEndpointHostname] = useState<string | null>(null);
+  const [endpointPort, setEndpointPort] = useState("");
+  const [yamlText, setYamlText] = useState(
+    [
+      "release_id: ",
+      "name: null",
+      "target:",
+      "  device_ids: []",
+      "  group_ids: []",
+      "rollout:",
+      "  strategy: immediate",
+    ].join("\n"),
+  );
+  // Once edited by hand, the YAML is kept until the user fills it from the wizard again.
+  const [yamlEdited, setYamlEdited] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+
+  const releasesQuery = useQuery({
+    queryKey: ["releases", organizationId, "deploy-wizard", token],
+    queryFn: () => listReleases(token, organizationId, { page_size: 100 }),
+  });
+  const devicesQuery = useQuery({
+    queryKey: ["devices", organizationId, "deploy-wizard", token],
+    queryFn: () => listDevices(token, organizationId, { page_size: 100, enabled: true }),
+  });
+  const groupsQuery = useQuery({
+    queryKey: ["device-groups", organizationId, "deploy-wizard", token],
+    queryFn: () => listDeviceGroups(token, organizationId),
+  });
+
+  const releases = releasesQuery.data?.items ?? [];
+  const selectedRelease: Release | undefined = useMemo(
+    () => releases.find((item) => item.id === releaseId),
+    [releases, releaseId],
+  );
+  const devices = devicesQuery.data?.items ?? [];
+  const groups = groupsQuery.data ?? [];
+
+  const skippedDevices = useMemo(() => {
+    const capKey = selectedRelease ? KIND_CAPABILITY[selectedRelease.kind] : undefined;
+    if (!capKey || deviceIds.length === 0) {
+      return [];
+    }
+    return devices.filter((device) => {
+      if (!deviceIds.includes(device.id)) {
+        return false;
+      }
+      const caps = device.metadata?.capabilities;
+      if (!caps || typeof caps !== "object" || Array.isArray(caps)) {
+        return false;
+      }
+      const record = caps as Record<string, unknown>;
+      if (!(capKey in record)) {
+        return false;
+      }
+      return record[capKey] === false;
+    });
+  }, [selectedRelease, deviceIds, devices]);
+
+  const singleDevice = deviceIds.length === 1 && groupIds.length === 0;
+  // A systemd release declares no port to route to; only containers can be published.
+  const publishableKind = selectedRelease?.kind !== "systemd";
+  const canPublish = singleDevice && publishableKind;
+  const endpointsQuery = useQuery({
+    queryKey: ["endpoints", organizationId, deviceIds[0], token],
+    queryFn: () => listEndpoints(token, organizationId, deviceIds[0]),
+    enabled: publish && canPublish,
+  });
+  const deviceEndpoints = endpointsQuery.data ?? [];
+  // Redeploying an app that is already public keeps its address (the API reuses it too).
+  const currentEndpoint = existingEndpointFor(selectedRelease, deviceEndpoints);
+  const effectiveHostname = currentEndpoint?.hostname ?? endpointHostname;
+  const portCheck = endpointPort.trim()
+    ? checkEndpointPort(selectedRelease, Number(endpointPort), deviceEndpoints)
+    : null;
+
+  function toggleId(list: string[], id: string, setList: (next: string[]) => void) {
+    setList(list.includes(id) ? list.filter((value) => value !== id) : [...list, id]);
+  }
+
+  function buildRollout(): DeploymentCreatePayload["rollout"] {
+    if (strategy === "batched") {
+      const size = batchSize.trim() ? Number(batchSize) : null;
+      return size && size > 0 ? { strategy: "batched", batch_size: size } : { strategy: "immediate" };
+    }
+    if (strategy === "phased") {
+      return {
+        strategy: "phased",
+        phases: PHASED_PRESETS[preset].phases,
+        ...(failureThreshold.trim() ? { failure_threshold_percent: Number(failureThreshold) } : {}),
+        ...(maxConcurrent.trim() ? { max_concurrent: Number(maxConcurrent) } : {}),
+        ...(pendingTimeout.trim() ? { pending_timeout_seconds: Number(pendingTimeout) } : {}),
+      };
+    }
+    return { strategy: "immediate" };
+  }
+
+  function buildPayload(): DeploymentCreatePayload {
+    const rollout = buildRollout();
+    const port = endpointPort.trim() ? Number(endpointPort) : null;
+    return {
+      release_id: releaseId,
+      name: name.trim() || null,
+      target: {
+        device_ids: deviceIds,
+        group_ids: groupIds,
+      },
+      rollout,
+      endpoint:
+        canPublish && publish && effectiveHostname && port
+          ? { hostname: effectiveHostname, port, protocol: "http" }
+          : null,
+      force,
+    };
+  }
+
+  async function submitPayload(payload: DeploymentCreatePayload) {
+    setSubmitting(true);
+    setError(null);
+    try {
+      const deployment = await createDeployment(token, organizationId, payload);
+      onCreated(deployment.id);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not start the deployment.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function onDeploy() {
+    if (!releaseId) {
+      setError("Select a release.");
+      return;
+    }
+    if (deviceIds.length === 0 && groupIds.length === 0) {
+      setError("Select at least one device or group.");
+      return;
+    }
+    if (strategy === "batched" && !(Number(batchSize) > 0)) {
+      setError("Enter a batch size.");
+      return;
+    }
+    if (publish && canPublish) {
+      if (!endpointPort.trim()) {
+        setError("Enter the port the app listens on.");
+        return;
+      }
+      if (portCheck?.level === "error") {
+        setError(portCheck.message);
+        return;
+      }
+      if (!effectiveHostname) {
+        setError("Choose an available public address.");
+        return;
+      }
+      // Same trap as the API: the only selected device is capability-skipped → no publish target.
+      if (
+        deviceIds.length === 1 &&
+        skippedDevices.length === 1 &&
+        skippedDevices[0]?.id === deviceIds[0]
+      ) {
+        const need = selectedRelease ? KIND_CAPABILITY[selectedRelease.kind] : "runtime";
+        setError(
+          `${skippedDevices[0].name} reported no ${need} support. Install that runtime on the device, wait for a heartbeat, then deploy again.`,
+        );
+        return;
+      }
+    }
+    await submitPayload(buildPayload());
+  }
+
+  async function onDeployYaml() {
+    try {
+      const raw = parseYamlObject(yamlText);
+      const target = (raw.target as Record<string, unknown> | undefined) ?? {};
+      const rolloutRaw = (raw.rollout as Record<string, unknown> | undefined) ?? {};
+      // The API trims and lowercases the strategy; match it so phased fields are kept.
+      const yamlStrategy = String(rolloutRaw.strategy ?? "immediate").trim().toLowerCase();
+      const payload: DeploymentCreatePayload = {
+        release_id: String(raw.release_id ?? ""),
+        name: raw.name == null ? null : String(raw.name),
+        target: {
+          device_ids: Array.isArray(target.device_ids) ? target.device_ids.map(String) : [],
+          group_ids: Array.isArray(target.group_ids) ? target.group_ids.map(String) : [],
+          device_type_ids: Array.isArray(target.device_type_ids)
+            ? target.device_type_ids.map(String)
+            : [],
+        },
+        rollout: {
+          strategy: yamlStrategy,
+          batch_size: NUMBER_OR_NULL(rolloutRaw.batch_size),
+          delay_seconds: NUMBER_OR_NULL(rolloutRaw.delay_seconds),
+          ...(yamlStrategy === "phased"
+            ? {
+                phases: Array.isArray(rolloutRaw.phases) ? (rolloutRaw.phases as RolloutPhase[]) : null,
+                max_concurrent: NUMBER_OR_NULL(rolloutRaw.max_concurrent),
+                failure_threshold_percent: NUMBER_OR_NULL(rolloutRaw.failure_threshold_percent),
+                pending_timeout_seconds: NUMBER_OR_NULL(rolloutRaw.pending_timeout_seconds),
+              }
+            : {}),
+        },
+        endpoint: (raw.endpoint as DeploymentCreatePayload["endpoint"]) ?? null,
+        force: raw.force === true,
+      };
+      if (!payload.release_id) {
+        setError("YAML must include release_id.");
+        return;
+      }
+      await submitPayload(payload);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid YAML.");
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="deploy-wizard-title"
+        className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-lg border border-border bg-card p-6 shadow-lg"
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 id="deploy-wizard-title" className="text-xl font-semibold">
+              Deploy release
+            </h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Choose a release and targets. Devices pick up desired software on the next heartbeat.
+            </p>
+          </div>
+          <Button type="button" variant="outline" size="sm" onClick={onClose}>
+            Close
+          </Button>
+        </div>
+
+        <div className="mt-4 flex gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === "wizard" ? "default" : "outline"}
+            onClick={() => setMode("wizard")}
+          >
+            Wizard
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === "yaml" ? "default" : "outline"}
+            onClick={() => {
+              // The YAML editor starts from what the wizard has chosen so far.
+              if (mode === "wizard" && !yamlEdited) {
+                setYamlText(toYaml(buildPayload()));
+              }
+              setMode("yaml");
+            }}
+          >
+            Advanced YAML
+          </Button>
+        </div>
+
+        {mode === "yaml" ? (
+          <div className="mt-6 space-y-3">
+            <label className="block text-sm font-medium" htmlFor="deploy-yaml">
+              Deploy body (YAML)
+            </label>
+            <textarea
+              id="deploy-yaml"
+              className="min-h-[220px] w-full rounded-md border border-input bg-field px-3 py-2 font-mono text-sm"
+              value={yamlText}
+              onChange={(event) => {
+                setYamlText(event.target.value);
+                setYamlEdited(true);
+              }}
+              spellCheck={false}
+            />
+            {error && <p className="text-sm text-destructive">{error}</p>}
+            <div className="flex justify-end gap-2 pt-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={submitting}
+                onClick={() => {
+                  setYamlText(toYaml(buildPayload()));
+                  setYamlEdited(false);
+                }}
+              >
+                Fill from wizard
+              </Button>
+              <Button type="button" disabled={submitting} onClick={() => void onDeployYaml()}>
+                {submitting ? "Deploying…" : "Deploy"}
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div className="mt-4 flex gap-2 text-sm text-muted-foreground">
+              <span className={step === 1 ? "font-medium text-foreground" : ""}>1. Release</span>
+              <span aria-hidden>→</span>
+              <span className={step === 2 ? "font-medium text-foreground" : ""}>2. Targets</span>
+              <span aria-hidden>→</span>
+              <span className={step === 3 ? "font-medium text-foreground" : ""}>3. Review</span>
+            </div>
+
+            {step === 1 && (
+              <div className="mt-6 space-y-3">
+                <label className="block text-sm font-medium" htmlFor="deploy-release">
+                  Release
+                </label>
+                <select
+                  id="deploy-release"
+                  className="h-10 w-full rounded-md border border-input bg-field px-3 text-sm"
+                  value={releaseId}
+                  onChange={(event) => {
+                    setReleaseId(event.target.value);
+                    // The address was picked for the old release; step 3 picks a new one.
+                    setEndpointHostname(null);
+                  }}
+                >
+                  <option value="">Select a release…</option>
+                  {releases.map((release) => (
+                    <option key={release.id} value={release.id}>
+                      {release.name} {release.version} ({KIND_LABELS[release.kind] ?? release.kind})
+                    </option>
+                  ))}
+                </select>
+                <Input
+                  placeholder="Optional name for this deploy"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                />
+                <div className="flex justify-end gap-2 pt-2">
+                  <Button type="button" disabled={!releaseId} onClick={() => setStep(2)}>
+                    Next
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {step === 2 && (
+              <div className="mt-6 space-y-6">
+                <div>
+                  <p className="text-sm font-medium">Device groups</p>
+                  <div className="mt-2 max-h-40 space-y-2 overflow-y-auto rounded-md border border-border p-3">
+                    {groups.length === 0 && (
+                      <p className="text-sm text-muted-foreground">No groups yet.</p>
+                    )}
+                    {groups.map((group) => (
+                      <label key={group.id} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={groupIds.includes(group.id)}
+                          onChange={() => toggleId(groupIds, group.id, setGroupIds)}
+                        />
+                        {group.name}
+                        <span className="text-muted-foreground">({group.device_count})</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <p className="text-sm font-medium">Devices</p>
+                  <div className="mt-2 max-h-48 space-y-2 overflow-y-auto rounded-md border border-border p-3">
+                    {devices.length === 0 && (
+                      <p className="text-sm text-muted-foreground">No enabled devices.</p>
+                    )}
+                    {devices.map((device) => (
+                      <label key={device.id} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="checkbox"
+                          checked={deviceIds.includes(device.id)}
+                          onChange={() => {
+                            toggleId(deviceIds, device.id, setDeviceIds);
+                            setEndpointHostname(null);
+                          }}
+                        />
+                        {device.name}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex justify-between gap-2 pt-2">
+                  <Button type="button" variant="outline" onClick={() => setStep(1)}>
+                    Back
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={deviceIds.length === 0 && groupIds.length === 0}
+                    onClick={() => setStep(3)}
+                  >
+                    Next
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {step === 3 && (
+              <div className="mt-6 space-y-4">
+                <dl className="space-y-2 text-sm">
+                  <div className="flex justify-between gap-4">
+                    <dt className="text-muted-foreground">Release</dt>
+                    <dd className="font-medium">
+                      {selectedRelease
+                        ? `${selectedRelease.name} ${selectedRelease.version}`
+                        : releaseId}
+                    </dd>
+                  </div>
+                  <div className="flex justify-between gap-4">
+                    <dt className="text-muted-foreground">Groups</dt>
+                    <dd>{groupIds.length}</dd>
+                  </div>
+                  <div className="flex justify-between gap-4">
+                    <dt className="text-muted-foreground">Devices</dt>
+                    <dd>{deviceIds.length}</dd>
+                  </div>
+                </dl>
+                <fieldset className="space-y-2">
+                  <legend className="text-sm font-medium">Rollout</legend>
+                  <div className="flex flex-wrap gap-2">
+                    {STRATEGIES.map((item) => (
+                      <Button
+                        key={item.value}
+                        type="button"
+                        size="sm"
+                        variant={strategy === item.value ? "default" : "outline"}
+                        aria-pressed={strategy === item.value}
+                        onClick={() => setStrategy(item.value)}
+                      >
+                        {item.label}
+                      </Button>
+                    ))}
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    {STRATEGIES.find((item) => item.value === strategy)?.hint}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Devices apply on their next heartbeat; progress updates as they check in.
+                  </p>
+                  {strategy === "batched" && (
+                    <>
+                      <label className="block text-sm font-medium" htmlFor="deploy-batch">
+                        Batch size
+                      </label>
+                      <Input
+                        id="deploy-batch"
+                        type="number"
+                        min={1}
+                        value={batchSize}
+                        onChange={(event) => setBatchSize(event.target.value)}
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        The next batch starts when every device in the current one has finished.
+                        Default {DEFAULT_BATCH_SIZE}
+                        {singleDevice || (groupIds.length === 0 && deviceIds.length <= Number(batchSize))
+                          ? "; with this few devices it behaves like Immediate."
+                          : "."}
+                      </p>
+                    </>
+                  )}
+                  {strategy === "phased" && (
+                    <>
+                      <label className="block text-sm font-medium" htmlFor="deploy-preset">
+                        Phases
+                      </label>
+                      <select
+                        id="deploy-preset"
+                        className="h-10 w-full rounded-md border border-input bg-field px-3 text-sm"
+                        value={preset}
+                        onChange={(event) => setPreset(event.target.value)}
+                      >
+                        {Object.entries(PHASED_PRESETS).map(([key, item]) => (
+                          <option key={key} value={key}>
+                            {item.label}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-muted-foreground">{PHASED_PRESETS[preset].hint}</p>
+                      <details className="rounded-md border border-border p-3">
+                        <summary className="cursor-pointer text-sm font-medium">Advanced</summary>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                          <label className="space-y-1 text-sm">
+                            <span>Pause at failure %</span>
+                            <Input
+                              type="number"
+                              min={0}
+                              max={100}
+                              value={failureThreshold}
+                              onChange={(event) => setFailureThreshold(event.target.value)}
+                            />
+                          </label>
+                          <label className="space-y-1 text-sm">
+                            <span>Max concurrent</span>
+                            <Input
+                              type="number"
+                              min={1}
+                              placeholder="No limit"
+                              value={maxConcurrent}
+                              onChange={(event) => setMaxConcurrent(event.target.value)}
+                            />
+                          </label>
+                          <label className="space-y-1 text-sm">
+                            <span>Pending timeout (s)</span>
+                            <Input
+                              type="number"
+                              min={60}
+                              placeholder="No timeout"
+                              value={pendingTimeout}
+                              onChange={(event) => setPendingTimeout(event.target.value)}
+                            />
+                          </label>
+                        </div>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Max concurrent (default {DEFAULT_MAX_CONCURRENT}) caps how many devices
+                          download and install at once; it only matters when a phase holds more
+                          devices than that. Clear it for no limit.
+                        </p>
+                        <p className="mt-2 text-xs text-muted-foreground">
+                          Offline devices stay pending and are marked timed out after the timeout;
+                          they still install when they come back.
+                        </p>
+                      </details>
+                    </>
+                  )}
+                </fieldset>
+                <div className="space-y-1">
+                  <label className="flex items-center gap-2 text-sm font-medium">
+                    <input
+                      type="checkbox"
+                      checked={force}
+                      onChange={(event) => setForce(event.target.checked)}
+                    />
+                    Reinstall where already installed
+                  </label>
+                  <p className="text-xs text-muted-foreground">
+                    Devices already running this release healthily are skipped by default, so they
+                    don't restart. Turn this on to reinstall on them too.
+                  </p>
+                </div>
+                {singleDevice && !publishableKind && (
+                  <p className="text-xs text-muted-foreground">
+                    Publishing on the internet is available for Single container and Compose
+                    releases.
+                  </p>
+                )}
+                {canPublish && (
+                  <div className="space-y-2 rounded-md border border-border p-3">
+                    <label className="flex items-center gap-2 text-sm font-medium">
+                      <input
+                        type="checkbox"
+                        checked={publish}
+                        onChange={(event) => {
+                          setPublish(event.target.checked);
+                          if (event.target.checked && !endpointPort.trim()) {
+                            setEndpointPort(suggestedEndpointPort(selectedRelease));
+                          }
+                        }}
+                      />
+                      Publish on the internet
+                    </label>
+                    {publish && (
+                      <>
+                        <Input
+                          type="number"
+                          min={1}
+                          max={65535}
+                          placeholder="Port the app listens on (80, 8080, …)"
+                          value={endpointPort}
+                          onChange={(event) => setEndpointPort(event.target.value)}
+                          aria-label="Port the app listens on"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          The port on the device (for docker, the host side of{" "}
+                          <code>host:container</code>). Each port can only be published once per
+                          device.
+                        </p>
+                        {portCheck && (
+                          <p
+                            className={
+                              portCheck.level === "error"
+                                ? "text-xs text-destructive"
+                                : "text-xs text-muted-foreground"
+                            }
+                          >
+                            {portCheck.message}
+                          </p>
+                        )}
+                        {currentEndpoint ? (
+                          <p className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                            Already published at <strong>{currentEndpoint.hostname}</strong>. This
+                            Deploy keeps that address and points it at the new release.
+                          </p>
+                        ) : (
+                          <AppAddressPicker
+                            token={token}
+                            organizationId={organizationId}
+                            deviceId={deviceIds[0]}
+                            appName={selectedRelease?.name ?? "app"}
+                            onChange={setEndpointHostname}
+                          />
+                        )}
+                        <p className="text-xs text-muted-foreground">
+                          The address goes live once the app is healthy on the device.
+                        </p>
+                      </>
+                    )}
+                  </div>
+                )}
+                {skippedDevices.length > 0 && (
+                  <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground">
+                    {skippedDevices.length} selected device
+                    {skippedDevices.length === 1 ? "" : "s"} reported no{" "}
+                    {selectedRelease ? KIND_CAPABILITY[selectedRelease.kind] : "runtime"} support
+                    and will be skipped: {skippedDevices.map((d) => d.name).join(", ")}.
+                  </p>
+                )}
+                {error && <p className="text-sm text-destructive">{error}</p>}
+                <div className="flex justify-between gap-2 pt-2">
+                  <Button type="button" variant="outline" onClick={() => setStep(2)}>
+                    Back
+                  </Button>
+                  <Button type="button" disabled={submitting} onClick={() => void onDeploy()}>
+                    {submitting ? "Deploying…" : "Deploy"}
+                  </Button>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}

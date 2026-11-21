@@ -1,0 +1,114 @@
+# Application endpoints
+
+A public address for one app on one device. Two forms, both under
+`APPS_BASE_DOMAIN` (for example `meteor-edge.com`):
+
+| Form | Example | Who picks it |
+|------|---------|--------------|
+| **Suggested** `<app>.<device>.<org>.<domain>` | `shop.kiosk-12.acme.meteor-edge.com` | the platform, from the app (release), device and organization names; a number is added (`shop-2`) while it is taken |
+| **Custom** `<name>.<org>.<domain>` | `shop.acme.meteor-edge.com` | the user; checked before saving |
+
+The organization is part of every address, so names never collide between
+organizations: an organization can only use addresses that end in its own
+organization name (and, for suggested addresses, one of **its own** devices).
+"Taken" means another endpoint in your organization already has that address.
+An organization whose slug is reserved (`www`, `api`, `admin`, `console`, …, plus
+`APPS_RESERVED_NAMES`) can't use custom names, only suggested addresses.
+
+**Short names.** A single-company install can set `APPS_ALLOW_SHORT_NAMES=true`
+(Helm: `connectivity.apps.allowShortNames`) to also allow `<name>.<domain>`.
+These are first come, first served across all organizations, and reserved names
+are refused. It is off by default. Endpoints that already have a short name keep
+it either way; the rule applies when an address is created or changed.
+
+An organization's addresses don't change when its slug is renamed: they keep
+working under the old slug, and new addresses must use the new one. The old slug
+stays reserved so no other organization can publish under it. The same
+organization can rename back to it, and it is freed when the organization is deleted.
+New slugs can have at most 63 characters, the length of one DNS label.
+
+One address per app port: two apps on the same device need different ports.
+Upstream addresses are **derived** from the device’s WireGuard IP; clients
+cannot pick an arbitrary destination.
+
+## API
+
+Requires `endpoint.read`. Create/update/delete need the matching
+`endpoint.create|update|delete` permission (device-group scoped).
+
+| Method | Path |
+|--------|------|
+| `GET` | `/api/v1/organizations/{org}/endpoints` (`device_id` filter) |
+| `GET` | `/api/v1/organizations/{org}/endpoints/hostname-suggestion?device_id=&app=` |
+| `GET` | `/api/v1/organizations/{org}/endpoints/hostname-check?device_id=&hostname=` |
+| `POST` | `/api/v1/organizations/{org}/endpoints` |
+| `GET` | `/api/v1/organizations/{org}/endpoints/{id}` |
+| `PATCH` | `/api/v1/organizations/{org}/endpoints/{id}` |
+| `DELETE` | `/api/v1/organizations/{org}/endpoints/{id}` |
+
+`hostname-suggestion` returns `{apps_domain, custom_domain, hostname, available}`;
+`custom_domain` is the domain a custom name goes under.
+`hostname-check` returns `{hostname, available, reason, message}` with
+`reason` one of `available`, `taken`, `reserved`, `invalid`, `not_yours`
+(an address of another device or organization). Pass
+`endpoint_id` when renaming so the endpoint's own address counts as available.
+
+Create body: `{ "device_id", "hostname", "port", "protocol": "http" }`.
+
+Availability (`unknown` / `ready` / `unhealthy` / `offline`) is separate from
+Deploy status. Traefik only routes **enabled** + **ready** endpoints. Manual
+endpoints (no workload or Deploy) are `ready` when the device’s WireGuard
+session is active, otherwise `offline`.
+
+Optional on Deploy create (exactly one target device, and only for `docker` or
+`docker_compose` releases; a `systemd` release returns `422 endpoint_requires_container`
+because it declares no port. Publish a systemd app by hand from the device's
+endpoints panel if it serves HTTP):
+
+```json
+"endpoint": { "port": 80 }                                   // suggested address
+"endpoint": { "hostname": "shop.acme.meteor-edge.com", "port": 80 } // custom address
+```
+
+The URL is not marked `ready` until that workload is in-sync and healthy. If
+the process stops after install, the Deploy stays Succeeded but the URL is no
+longer `ready` (Traefik stops routing it) until the agent reports it healthy again.
+
+### Port rules
+
+The upstream is `<device WireGuard IP>:<port>`, so `port` is the port **on the
+device**. For a docker release that is the host side of `host:container`
+(`"8080:80"` → publish `8080`). The API checks, on Deploy create:
+
+| Code | When |
+|------|------|
+| `reserved_port` | The port is the device SSH port. |
+| `endpoint_port_mismatch` | Docker release whose `ports` do not publish this host port on TCP, including a release with no fixed host port (`"80"` alone, or no `ports`). |
+| `endpoint_port_loopback` | Docker binds the port to `127.0.0.1`/`::1` only; WireGuard cannot reach it. |
+| `device_port_in_use` (409) | Another workload on a target device already uses the port: a docker host binding or another app's public address. Also raised for a docker release whose host ports clash, even without publishing. Devices that skip the release (no runtime for its kind) are not checked. A docker `ports` entry may span at most 1023 host ports (`invalid_release_spec` otherwise), so every bound port is checked. |
+
+The same workload never conflicts with itself: redeploying replaces it. If
+the app already has a public address on the device, the Deploy keeps that
+address and points it at the new Deploy instead of creating a second one.
+Compose and systemd apps only declare a port through their endpoint, so a port
+they bind without one is not checked; the agent reports the bind error.
+
+## Reverse proxy
+
+Traefik polls `GET /internal/routing/traefik` (internal token, not public).
+No per-app file edit or Traefik restart. Disable or delete an endpoint and the
+next poll drops the route.
+
+DNS: one wildcard `*.<APPS_BASE_DOMAIN>` to the gateway; it answers for every
+depth, so it covers both forms. Certificates (Traefik DNS-01, resolver
+`letsencrypt-dns`): one wildcard `*.<org>.<domain>` per organization with custom
+names, one `*.<device>.<org>.<domain>` per device with published apps, and
+`*.<domain>` if short names are used, requested the first time a route needs it (a minute or two). Let's Encrypt allows about 50 new
+certificates per registered domain per week (renewals excluded); ask for a
+higher limit before onboarding more devices than that per week. Credentials via
+env only.
+
+## Related
+
+- [Device connectivity](connectivity.md)
+- [Deployments](deployments.md)

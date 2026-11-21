@@ -9,14 +9,23 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.artifacts.repository import ArtifactRepository
 from app.audit.service import AuditRecorder
+from app.authorization.service import AuthzService
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ConflictError, ForbiddenError, NotFoundError
+from app.devices.device_config import (
+    DEVICE_CONFIG_FILE_NAME,
+    DeviceConfigRequest,
+    DeviceConfigResponse,
+    render_device_config,
+)
 from app.devices.models import (
     Device,
     DeviceEnrollmentRequest,
@@ -26,7 +35,13 @@ from app.devices.models import (
     EnrollmentApiKey,
     RegistrationToken,
 )
-from app.devices.permissions import can_manage_fleet
+from app.devices.naming import (
+    default_device_name,
+    device_type_slug_for,
+    hardware_suffix,
+    match_device_type,
+    unique_device_name,
+)
 from app.devices.repository import (
     DeviceEnrollmentRequestRepository,
     DeviceGroupRepository,
@@ -65,8 +80,13 @@ from app.devices.tokens import (
 from app.identity.models import User
 from app.mqtt.schemas import DevicePingResponse, MqttTestPublishResponse
 from app.mqtt.service import MqttPublisher, MqttService
-from app.tenancy.models import OrganizationMembership, OrganizationRole
+from app.tenancy.models import OrganizationMembership
 from app.tenancy.repository import OrganizationRepository
+from app.tenancy.schemas import slugify
+
+
+def _jsonable(value: Any) -> Any:
+    return str(value) if isinstance(value, uuid.UUID) else value
 
 
 class FleetService:
@@ -74,12 +94,14 @@ class FleetService:
         self.session = session
         self.settings = settings or get_settings()
         self.organizations = OrganizationRepository(session)
+        self.authz = AuthzService(session)
         self.device_types = DeviceTypeRepository(session)
         self.device_groups = DeviceGroupRepository(session)
         self.tokens = RegistrationTokenRepository(session)
         self.devices = DeviceRepository(session)
         self.api_keys = EnrollmentApiKeyRepository(session)
         self.enrollment_requests = DeviceEnrollmentRequestRepository(session)
+        self.artifacts = ArtifactRepository(session)
         self.audit = AuditRecorder(session)
 
     def _record_audit(
@@ -91,6 +113,7 @@ class FleetService:
         resource_type: str,
         resource_id: uuid.UUID | str | None = None,
         metadata: dict[str, Any] | None = None,
+        outcome: str = "success",
     ) -> None:
         self.audit.record(
             actor=actor,
@@ -99,6 +122,7 @@ class FleetService:
             resource_type=resource_type,
             resource_id=resource_id,
             metadata=metadata,
+            outcome=outcome,
         )
 
     # ---------------------------------------------------------------- helpers
@@ -107,31 +131,86 @@ class FleetService:
         organization_id: uuid.UUID,
         user_id: uuid.UUID,
     ) -> OrganizationMembership:
-        result = self.organizations.get_for_user(
-            organization_id=organization_id,
-            user_id=user_id,
-        )
-        if result is None:
-            raise NotFoundError("organization_not_found", "Organization was not found.")
-        return result[1]
+        return self.authz.require_membership(user_id=user_id, organization_id=organization_id)
 
-    def _require_manage(self, role: OrganizationRole) -> None:
-        if not can_manage_fleet(role):
-            raise ForbiddenError(
-                "insufficient_permission",
-                "You do not have permission to manage fleet resources.",
-            )
+    def _require(
+        self,
+        membership: OrganizationMembership,
+        permission: str,
+        *,
+        device_group_id: uuid.UUID | None = None,
+    ) -> None:
+        self.authz.require(membership, permission, device_group_id=device_group_id)
+
+    def _resolve_slug(
+        self,
+        *,
+        requested: str | None,
+        name: str,
+        fallback: str,
+        repository: DeviceTypeRepository | DeviceGroupRepository,
+        organization_id: uuid.UUID,
+        conflict_code: str,
+    ) -> str:
+        """Use an explicit slug (must be free) or derive a unique one from the name."""
+
+        def taken(slug: str) -> bool:
+            return repository.get_by_slug(organization_id=organization_id, slug=slug) is not None
+
+        if requested is not None:
+            if taken(requested):
+                raise ConflictError(conflict_code, "This slug is already in use.")
+            return requested
+        base = (slugify(name) or fallback)[:90].strip("-") or fallback
+        candidate, suffix = base, 2
+        while taken(candidate):
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
 
     # ------------------------------------------------------------- device types
+    def _to_device_type_response(
+        self,
+        device_type: DeviceType,
+        *,
+        device_count: int | None = None,
+        artifact_count: int | None = None,
+    ) -> DeviceTypeResponse:
+        """Return catalog metadata with device and artifact counts.
+
+        Query any count passed as None; use explicitly supplied counts unchanged.
+        """
+        organization_id = device_type.organization_id
+        if device_count is None:
+            device_count = self.device_types.count_devices(organization_id=organization_id, type_id=device_type.id)
+        if artifact_count is None:
+            artifact_count = self.artifacts.count_by_device_type(organization_id=organization_id).get(device_type.id, 0)
+        return DeviceTypeResponse.model_validate(device_type).model_copy(
+            update={"device_count": device_count, "artifact_count": artifact_count}
+        )
+
     def list_device_types(
         self,
         *,
         actor: User,
         organization_id: uuid.UUID,
     ) -> list[DeviceTypeResponse]:
-        self._require_membership(organization_id, actor.id)
+        """Return types ordered by name with assigned device and artifact counts.
+
+        Raise NotFoundError for missing organization membership;
+        database and response validation errors propagate.
+        """
+        membership = self._require_membership(organization_id, actor.id)
+        self._require(membership, "device_type.read")
+        device_counts = self.device_types.device_counts(organization_id=organization_id)
+        artifact_counts = self.artifacts.count_by_device_type(organization_id=organization_id)
         return [
-            DeviceTypeResponse.model_validate(item) for item in self.device_types.list(organization_id=organization_id)
+            self._to_device_type_response(
+                item,
+                device_count=device_counts.get(item.id, 0),
+                artifact_count=artifact_counts.get(item.id, 0),
+            )
+            for item in self.device_types.list(organization_id=organization_id)
         ]
 
     def get_device_type(
@@ -141,9 +220,14 @@ class FleetService:
         organization_id: uuid.UUID,
         type_id: uuid.UUID,
     ) -> DeviceTypeResponse:
-        self._require_membership(organization_id, actor.id)
+        """Return type metadata and counts, raising NotFoundError for missing access or type.
+
+        Database and response validation errors propagate.
+        """
+        membership = self._require_membership(organization_id, actor.id)
+        self._require(membership, "device_type.read")
         device_type = self._require_device_type(organization_id, type_id)
-        return DeviceTypeResponse.model_validate(device_type)
+        return self._to_device_type_response(device_type)
 
     def create_device_type(
         self,
@@ -152,23 +236,50 @@ class FleetService:
         organization_id: uuid.UUID,
         payload: DeviceTypeCreateRequest,
     ) -> DeviceTypeResponse:
+        """Commit a type with an explicit slug or one derived uniquely from its name.
+
+        Raise NotFoundError for absent membership, ForbiddenError for a non-manager,
+        and ConflictError for an existing name or explicit slug. Database and
+        response validation errors propagate.
+        """
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device_type.create")
         if self.device_types.get_by_name(organization_id=organization_id, name=payload.name):
             raise ConflictError(
                 "device_type_exists",
                 "A device type with this name already exists.",
             )
+        slug = self._resolve_slug(
+            requested=payload.slug,
+            name=payload.name,
+            fallback="device-type",
+            repository=self.device_types,
+            organization_id=organization_id,
+            conflict_code="device_type_slug_exists",
+        )
         device_type = DeviceType(
             organization_id=organization_id,
             name=payload.name,
+            slug=slug,
             description=payload.description,
+            manufacturer=payload.manufacturer,
+            model=payload.model,
+            architecture=payload.architecture,
             capabilities=payload.capabilities,
+            metadata_=payload.metadata,
         )
         self.device_types.create(device_type)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device_type.create",
+            resource_type="device_type",
+            resource_id=device_type.id,
+            metadata={"name": device_type.name, "slug": device_type.slug},
+        )
         self.session.commit()
         self.session.refresh(device_type)
-        return DeviceTypeResponse.model_validate(device_type)
+        return self._to_device_type_response(device_type, device_count=0, artifact_count=0)
 
     def update_device_type(
         self,
@@ -178,8 +289,17 @@ class FleetService:
         type_id: uuid.UUID,
         payload: DeviceTypeUpdateRequest,
     ) -> DeviceTypeResponse:
+        """Commit catalog changes and return metadata with current counts.
+
+        Omitted fields remain unchanged. Explicit null clears description,
+        manufacturer, model, or architecture; other null fields are ignored.
+        Renaming preserves the slug unless a new slug is supplied. Raise
+        NotFoundError for missing membership/type, ForbiddenError for a non-manager,
+        and ConflictError for a name or slug collision. Database and response
+        validation errors propagate.
+        """
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device_type.update")
         device_type = self._require_device_type(organization_id, type_id)
 
         if payload.name is not None and payload.name.lower() != device_type.name.lower():
@@ -189,17 +309,37 @@ class FleetService:
                     "device_type_exists",
                     "A device type with this name already exists.",
                 )
+        if payload.slug is not None and payload.slug != device_type.slug:
+            device_type.slug = self._resolve_slug(
+                requested=payload.slug,
+                name=device_type.name,
+                fallback="device-type",
+                repository=self.device_types,
+                organization_id=organization_id,
+                conflict_code="device_type_slug_exists",
+            )
         if payload.name is not None:
             device_type.name = payload.name
-        if payload.description is not None:
-            device_type.description = payload.description
+        for field in ("description", "manufacturer", "model", "architecture"):
+            if field in payload.model_fields_set:
+                setattr(device_type, field, getattr(payload, field))
         if payload.capabilities is not None:
             device_type.capabilities = payload.capabilities
+        if payload.metadata is not None:
+            device_type.metadata_ = payload.metadata
 
         self.device_types.update(device_type)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device_type.update",
+            resource_type="device_type",
+            resource_id=device_type.id,
+            metadata={"name": device_type.name, "fields": sorted(payload.model_fields_set)},
+        )
         self.session.commit()
         self.session.refresh(device_type)
-        return DeviceTypeResponse.model_validate(device_type)
+        return self._to_device_type_response(device_type)
 
     def delete_device_type(
         self,
@@ -208,14 +348,33 @@ class FleetService:
         organization_id: uuid.UUID,
         type_id: uuid.UUID,
     ) -> None:
+        """Commit deletion of a type only if it has neither devices nor artifacts.
+
+        Raise NotFoundError for missing membership/type, ForbiddenError for a
+        non-manager, and ConflictError if the type is in use. Database errors
+        propagate.
+        """
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device_type.delete")
         device_type = self._require_device_type(organization_id, type_id)
         if self.device_types.count_devices(organization_id=organization_id, type_id=type_id):
             raise ConflictError(
                 "device_type_in_use",
                 "This device type is still assigned to devices.",
             )
+        if self.artifacts.count_by_device_type(organization_id=organization_id).get(type_id):
+            raise ConflictError(
+                "device_type_has_artifacts",
+                "This device type still has artifacts. Delete them first.",
+            )
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device_type.delete",
+            resource_type="device_type",
+            resource_id=type_id,
+            metadata={"name": device_type.name},
+        )
         self.device_types.delete(device_type)
         self.session.commit()
 
@@ -226,17 +385,32 @@ class FleetService:
         return device_type
 
     # ------------------------------------------------------------ device groups
+    def _to_device_group_response(self, group: DeviceGroup, *, device_count: int | None = None) -> DeviceGroupResponse:
+        """Return group metadata, querying the device count only when it is None."""
+        if device_count is None:
+            device_count = self.device_groups.count_devices(organization_id=group.organization_id, group_id=group.id)
+        return DeviceGroupResponse.model_validate(group).model_copy(update={"device_count": device_count})
+
     def list_device_groups(
         self,
         *,
         actor: User,
         organization_id: uuid.UUID,
     ) -> list[DeviceGroupResponse]:
-        self._require_membership(organization_id, actor.id)
-        return [
-            DeviceGroupResponse.model_validate(item)
-            for item in self.device_groups.list(organization_id=organization_id)
-        ]
+        """Return groups ordered by name with assigned device counts.
+
+        Raise NotFoundError for missing organization membership;
+        database and response validation errors propagate.
+        """
+        membership = self._require_membership(organization_id, actor.id)
+        self.authz.require_role_permission(membership, "device_group.read")
+        counts = self.device_groups.device_counts(organization_id=organization_id)
+        groups = self.device_groups.list(organization_id=organization_id)
+        scope = self.authz.scope_for(membership)
+        if scope.mode == "device_groups":
+            allowed = set(scope.device_group_ids)
+            groups = [item for item in groups if item.id in allowed]
+        return [self._to_device_group_response(item, device_count=counts.get(item.id, 0)) for item in groups]
 
     def get_device_group(
         self,
@@ -245,9 +419,14 @@ class FleetService:
         organization_id: uuid.UUID,
         group_id: uuid.UUID,
     ) -> DeviceGroupResponse:
-        self._require_membership(organization_id, actor.id)
+        """Return group metadata and count, raising NotFoundError for missing access or group.
+
+        Database and response validation errors propagate.
+        """
+        membership = self._require_membership(organization_id, actor.id)
         group = self._require_device_group(organization_id, group_id)
-        return DeviceGroupResponse.model_validate(group)
+        self._require(membership, "device_group.read", device_group_id=group.id)
+        return self._to_device_group_response(group)
 
     def create_device_group(
         self,
@@ -256,23 +435,47 @@ class FleetService:
         organization_id: uuid.UUID,
         payload: DeviceGroupCreateRequest,
     ) -> DeviceGroupResponse:
+        """Commit a group with an explicit slug or one derived uniquely from its name.
+
+        Raise NotFoundError for absent membership, ForbiddenError for a non-manager,
+        and ConflictError for an existing name or explicit slug. Database and
+        response validation errors propagate.
+        """
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device_group.create")
         if self.device_groups.get_by_name(organization_id=organization_id, name=payload.name):
             raise ConflictError(
                 "device_group_exists",
                 "A device group with this name already exists.",
             )
+        slug = self._resolve_slug(
+            requested=payload.slug,
+            name=payload.name,
+            fallback="device-group",
+            repository=self.device_groups,
+            organization_id=organization_id,
+            conflict_code="device_group_slug_exists",
+        )
         group = DeviceGroup(
             organization_id=organization_id,
             name=payload.name,
+            slug=slug,
             description=payload.description,
             labels=payload.labels,
+            metadata_=payload.metadata,
         )
         self.device_groups.create(group)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device_group.create",
+            resource_type="device_group",
+            resource_id=group.id,
+            metadata={"name": group.name, "slug": group.slug},
+        )
         self.session.commit()
         self.session.refresh(group)
-        return DeviceGroupResponse.model_validate(group)
+        return self._to_device_group_response(group, device_count=0)
 
     def update_device_group(
         self,
@@ -282,8 +485,16 @@ class FleetService:
         group_id: uuid.UUID,
         payload: DeviceGroupUpdateRequest,
     ) -> DeviceGroupResponse:
+        """Commit group changes and return metadata with the current device count.
+
+        Explicit null clears description; other null or omitted fields are ignored.
+        Renaming preserves the slug unless a new slug is supplied. Raise
+        NotFoundError for missing membership/group, ForbiddenError for a non-manager,
+        and ConflictError for a name or slug collision. Database and response
+        validation errors propagate.
+        """
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device_group.update", device_group_id=group_id)
         group = self._require_device_group(organization_id, group_id)
 
         if payload.name is not None and payload.name.lower() != group.name.lower():
@@ -293,17 +504,36 @@ class FleetService:
                     "device_group_exists",
                     "A device group with this name already exists.",
                 )
+        if payload.slug is not None and payload.slug != group.slug:
+            group.slug = self._resolve_slug(
+                requested=payload.slug,
+                name=group.name,
+                fallback="device-group",
+                repository=self.device_groups,
+                organization_id=organization_id,
+                conflict_code="device_group_slug_exists",
+            )
         if payload.name is not None:
             group.name = payload.name
-        if payload.description is not None:
+        if "description" in payload.model_fields_set:
             group.description = payload.description
         if payload.labels is not None:
             group.labels = payload.labels
+        if payload.metadata is not None:
+            group.metadata_ = payload.metadata
 
         self.device_groups.update(group)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device_group.update",
+            resource_type="device_group",
+            resource_id=group.id,
+            metadata={"name": group.name, "fields": sorted(payload.model_fields_set)},
+        )
         self.session.commit()
         self.session.refresh(group)
-        return DeviceGroupResponse.model_validate(group)
+        return self._to_device_group_response(group)
 
     def delete_device_group(
         self,
@@ -313,13 +543,21 @@ class FleetService:
         group_id: uuid.UUID,
     ) -> None:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device_group.delete", device_group_id=group_id)
         group = self._require_device_group(organization_id, group_id)
         if self.device_groups.count_devices(organization_id=organization_id, group_id=group_id):
             raise ConflictError(
                 "device_group_in_use",
                 "This device group is still assigned to devices.",
             )
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device_group.delete",
+            resource_type="device_group",
+            resource_id=group_id,
+            metadata={"name": group.name},
+        )
         self.device_groups.delete(group)
         self.session.commit()
 
@@ -336,7 +574,8 @@ class FleetService:
         actor: User,
         organization_id: uuid.UUID,
     ) -> list[RegistrationTokenResponse]:
-        self._require_membership(organization_id, actor.id)
+        membership = self._require_membership(organization_id, actor.id)
+        self._require(membership, "device.read")
         return [
             RegistrationTokenResponse.model_validate(item) for item in self.tokens.list(organization_id=organization_id)
         ]
@@ -349,7 +588,7 @@ class FleetService:
         payload: RegistrationTokenCreateRequest,
     ) -> RegistrationTokenCreateResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device.create")
 
         if payload.device_type_id is not None:
             self._require_device_type(organization_id, payload.device_type_id)
@@ -399,7 +638,7 @@ class FleetService:
         token_id: uuid.UUID,
     ) -> RegistrationTokenResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device.create")
         token = self.tokens.get(organization_id=organization_id, token_id=token_id)
         if token is None:
             raise NotFoundError(
@@ -427,7 +666,8 @@ class FleetService:
         actor: User,
         organization_id: uuid.UUID,
     ) -> list[EnrollmentApiKeyResponse]:
-        self._require_membership(organization_id, actor.id)
+        membership = self._require_membership(organization_id, actor.id)
+        self._require(membership, "enrollment_key.read")
         return [
             EnrollmentApiKeyResponse.model_validate(item)
             for item in self.api_keys.list(organization_id=organization_id)
@@ -441,7 +681,7 @@ class FleetService:
         payload: EnrollmentApiKeyCreateRequest,
     ) -> EnrollmentApiKeyCreateResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "enrollment_key.manage")
 
         if payload.expires_at is not None and payload.expires_at <= datetime.now(UTC):
             raise ConflictError("invalid_expiry", "Expiry must be in the future.")
@@ -481,7 +721,7 @@ class FleetService:
         key_id: uuid.UUID,
     ) -> EnrollmentApiKeyResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "enrollment_key.manage")
         key = self.api_keys.get(organization_id=organization_id, key_id=key_id)
         if key is None:
             raise NotFoundError(
@@ -502,6 +742,15 @@ class FleetService:
             self.session.refresh(key)
         return EnrollmentApiKeyResponse.model_validate(key)
 
+    # ----------------------------------------------------- device config file
+    def create_device_config(
+        self, *, actor: User, organization_id: uuid.UUID, payload: DeviceConfigRequest
+    ) -> DeviceConfigResponse:
+        """Render the first-boot settings file. It holds secrets, so nothing is stored or logged."""
+        membership = self._require_membership(organization_id, actor.id)
+        self._require(membership, "device.create")
+        return DeviceConfigResponse(file_name=DEVICE_CONFIG_FILE_NAME, content=render_device_config(payload))
+
     # --------------------------------------------------- enrollment requests
     def list_enrollment_requests(
         self,
@@ -510,11 +759,98 @@ class FleetService:
         organization_id: uuid.UUID,
         status: str | None = None,
     ) -> list[DeviceEnrollmentRequestResponse]:
-        self._require_membership(organization_id, actor.id)
+        membership = self._require_membership(organization_id, actor.id)
+        self._require(membership, "device.read")
+        rows = self.enrollment_requests.list(organization_id=organization_id, status=status)
+        # A status filter must not hide requests that already hold a name.
+        all_rows = rows
+        if status is not None:
+            all_rows = self.enrollment_requests.list(organization_id=organization_id, status=None)
+        device_types = self.device_types.list(organization_id=organization_id)
+        suggested = self._suggested_names(organization_id, all_rows, device_types=device_types)
         return [
-            DeviceEnrollmentRequestResponse.model_validate(item)
-            for item in self.enrollment_requests.list(organization_id=organization_id, status=status)
+            DeviceEnrollmentRequestResponse.model_validate(item).model_copy(
+                update={"suggested_name": suggested.get(item.id), **self._naming_hints(item, suggested, device_types)}
+            )
+            for item in rows
         ]
+
+    @staticmethod
+    def _naming_hints(
+        row: DeviceEnrollmentRequest, suggested: dict[uuid.UUID, str], device_types: list[DeviceType]
+    ) -> dict[str, Any]:
+        """What the approval dialog needs to keep ``<kind>-<suffix>`` in step with the chosen device type."""
+        if row.status != "pending":
+            return {}
+        hints: dict[str, Any] = {}
+        if row.device_type_id is None:
+            matched = match_device_type(row.hardware_model, device_types)
+            hints["suggested_device_type_id"] = matched.id if matched is not None else None
+        suffix = hardware_suffix(serial_number=row.serial_number, mac_addresses=row.mac_addresses or [])
+        name = suggested.get(row.id)
+        # Only a generated name follows the type: a chosen or kept name stays as it is.
+        if suffix and name and not row.assigned_name and name.endswith(f"-{suffix}"):
+            hints["name_suffix"] = suffix
+        return hints
+
+    def _suggested_names(
+        self,
+        organization_id: uuid.UUID,
+        rows: list[DeviceEnrollmentRequest],
+        *,
+        include_existing: bool = True,
+        device_types: list[DeviceType] | None = None,
+    ) -> dict[uuid.UUID, str]:
+        """A name per unclaimed request: a re-enrolling device keeps its own, others get distinct defaults.
+
+        With ``include_existing=False``, requests from a device that is already enrolled are left out.
+        """
+        unclaimed = sorted(
+            (row for row in rows if row.status in {"pending", "approved"} and row.claimed_at is None),
+            key=lambda row: row.created_at,
+        )
+        if not unclaimed:
+            return {}
+        if device_types is None:
+            device_types = self.device_types.list(organization_id=organization_id)
+        known = self.devices.list_identities(organization_id=organization_id)
+        taken = {device.name.casefold() for device in known}
+        taken.update(row.assigned_name.casefold() for row in unclaimed if row.assigned_name)
+        names_by_id = {device.id: device.name for device in known}
+        ids_by_serial: dict[str, set[uuid.UUID]] = defaultdict(set)
+        ids_by_mac: dict[str, set[uuid.UUID]] = defaultdict(set)
+        for device in known:
+            if device.serial_number:
+                ids_by_serial[device.serial_number].add(device.id)
+            for mac in device.mac_addresses or []:
+                ids_by_mac[mac].add(device.id)
+        suggested: dict[uuid.UUID, str] = {}
+        for row in unclaimed:
+            if row.assigned_name:
+                suggested[row.id] = row.assigned_name
+                continue
+            matches = set(ids_by_serial.get(row.serial_number, ()))
+            for mac in row.mac_addresses or []:
+                matches |= ids_by_mac.get(mac, set())
+            # Several matches: the claim will be refused as ambiguous, so there is no name to keep.
+            if len(matches) == 1:
+                if include_existing:
+                    suggested[row.id] = names_by_id[matches.pop()]
+                continue
+            name = unique_device_name(
+                default_device_name(
+                    requested_name=row.requested_name,
+                    hostname=row.hostname,
+                    serial_number=row.serial_number,
+                    mac_addresses=row.mac_addresses or [],
+                    device_type_slug=device_type_slug_for(row.device_type_id, row.hardware_model, device_types),
+                    hardware_model=row.hardware_model,
+                ),
+                taken=taken,
+            )
+            taken.add(name.casefold())
+            suggested[row.id] = name
+        return suggested
 
     def approve_enrollment_request(
         self,
@@ -525,7 +861,7 @@ class FleetService:
         payload: EnrollmentApproveRequest,
     ) -> DeviceEnrollmentRequestResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device.create")
         request = self._require_enrollment_request(organization_id, request_id)
         if request.status != "pending":
             raise ConflictError(
@@ -540,6 +876,13 @@ class FleetService:
             request.device_group_id = payload.device_group_id
         if payload.name is not None:
             request.assigned_name = payload.name
+        elif not request.assigned_name:
+            # Keep the name the list showed, so a later request claiming first can't take it.
+            self.devices.lock_names(organization_id=organization_id)
+            every_request = self.enrollment_requests.list(organization_id=organization_id, status=None)
+            request.assigned_name = self._suggested_names(organization_id, every_request, include_existing=False).get(
+                request.id
+            )
 
         request.status = "approved"
         request.reviewed_by_user_id = actor.id
@@ -565,7 +908,7 @@ class FleetService:
         payload: EnrollmentRejectRequest,
     ) -> DeviceEnrollmentRequestResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "device.create")
         request = self._require_enrollment_request(organization_id, request_id)
         if request.status != "pending":
             raise ConflictError(
@@ -604,23 +947,34 @@ class FleetService:
         actor: User,
         organization_id: uuid.UUID,
         search: str | None = None,
+        name: str | None = None,
         device_type_id: uuid.UUID | None = None,
         device_group_id: uuid.UUID | None = None,
         architecture: str | None = None,
         enabled: bool | None = None,
         status: str | None = None,
-        sort: str = "name",
-        order: str = "asc",
+        sort: str = "last_seen_at",
+        order: str = "desc",
         page: int = 1,
         page_size: int = 20,
     ) -> Page[DeviceResponse]:
-        self._require_membership(organization_id, actor.id)
+        membership = self._require_membership(organization_id, actor.id)
+        self.authz.require_role_permission(membership, "device.read")
+        scope = self.authz.scope_for(membership)
+        allowed_group_ids: list[uuid.UUID] | None = None
+        if scope.mode == "device_groups":
+            if device_group_id is not None and device_group_id not in scope.device_group_ids:
+                return Page[DeviceResponse](items=[], total=0, page=page, page_size=page_size)
+            # Scoped members never see ungrouped devices.
+            allowed_group_ids = list(scope.device_group_ids)
         cutoff = offline_cutoff(offline_threshold_seconds=self.settings.device_offline_threshold_seconds)
         devices, total = self.devices.list_paginated(
             organization_id=organization_id,
             search=search,
+            name=name,
             device_type_id=device_type_id,
             device_group_id=device_group_id,
+            allowed_group_ids=allowed_group_ids,
             architecture=architecture,
             enabled=enabled,
             status=status,
@@ -637,6 +991,24 @@ class FleetService:
             page_size=page_size,
         )
 
+    def fleet_counts(self, *, actor: User, organization_id: uuid.UUID) -> tuple[int, int]:
+        """(registered devices, online now) for the whole organization; needs org-wide device.read."""
+        membership = self._require_membership(organization_id, actor.id)
+        self.authz.require_role_permission(membership, "device.read")
+        if self.authz.scope_for(membership).mode == "device_groups":
+            raise ForbiddenError("fleet_scope_required", "Fleet history needs access to the whole organization.")
+        total = self.list_devices(actor=actor, organization_id=organization_id, page_size=1).total
+        online = self.list_devices(actor=actor, organization_id=organization_id, status="online", page_size=1).total
+        return total, online
+
+    def require_device_permission(
+        self, *, actor: User, organization_id: uuid.UUID, device_id: uuid.UUID, permission: str
+    ) -> None:
+        """404 for a device outside the organization, 403 without ``permission`` on its group."""
+        membership = self._require_membership(organization_id, actor.id)
+        device = self._require_device(organization_id, device_id)
+        self._require(membership, permission, device_group_id=device.device_group_id)
+
     def get_device(
         self,
         *,
@@ -644,8 +1016,9 @@ class FleetService:
         organization_id: uuid.UUID,
         device_id: uuid.UUID,
     ) -> DeviceResponse:
-        self._require_membership(organization_id, actor.id)
+        membership = self._require_membership(organization_id, actor.id)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.read", device_group_id=device.device_group_id)
         return self._to_device_response(device)
 
     def update_device(
@@ -657,8 +1030,13 @@ class FleetService:
         payload: DeviceUpdateRequest,
     ) -> DeviceResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.update", device_group_id=device.device_group_id)
+        before = {
+            "name": device.name,
+            "device_type_id": device.device_type_id,
+            "device_group_id": device.device_group_id,
+        }
 
         if payload.name is not None:
             device.name = payload.name
@@ -668,9 +1046,11 @@ class FleetService:
             self._require_device_type(organization_id, payload.device_type_id)
             device.device_type_id = payload.device_type_id
         if payload.clear_device_group:
+            self._require(membership, "device.update", device_group_id=None)
             device.device_group_id = None
         elif payload.device_group_id is not None:
             self._require_device_group(organization_id, payload.device_group_id)
+            self._require(membership, "device.update", device_group_id=payload.device_group_id)
             device.device_group_id = payload.device_group_id
         if payload.labels is not None:
             device.labels = payload.labels
@@ -678,6 +1058,27 @@ class FleetService:
             device.metadata_ = payload.metadata
 
         self.devices.update(device)
+        after = {
+            "name": device.name,
+            "device_type_id": device.device_type_id,
+            "device_group_id": device.device_group_id,
+        }
+        changes = {
+            key: {"from": _jsonable(before[key]), "to": _jsonable(after[key])}
+            for key in before
+            if before[key] != after[key]
+        }
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device.update",
+            resource_type="device",
+            resource_id=device.id,
+            metadata={
+                "changes": changes,
+                "fields": sorted(payload.model_fields_set),
+            },
+        )
         self.session.commit()
         self.session.refresh(device)
         return self._to_device_response(device)
@@ -690,8 +1091,8 @@ class FleetService:
         device_id: uuid.UUID,
     ) -> None:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.delete", device_group_id=device.device_group_id)
         device_name = device.name
         self.devices.delete(device)
         self._record_audit(
@@ -704,6 +1105,12 @@ class FleetService:
         )
         self.session.commit()
 
+    def _mark_mqtt_offline(self, device: Device) -> None:
+        if device.mqtt_status == "online":
+            device.mqtt_status = "offline"
+            device.mqtt_status_at = datetime.now(UTC)
+            self.session.add(device)
+
     def set_device_enabled(
         self,
         *,
@@ -713,10 +1120,53 @@ class FleetService:
         enabled: bool,
     ) -> DeviceResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.update", device_group_id=device.device_group_id)
+        changed = device.is_enabled != enabled
         device.is_enabled = enabled
+        if changed and not enabled:
+            # MQTT access ends now, so the device's own "offline" will is refused.
+            self._mark_mqtt_offline(device)
         self.devices.update(device)
+        if changed:
+            self._record_audit(
+                actor=actor,
+                organization_id=organization_id,
+                action="device.enable" if enabled else "device.disable",
+                resource_type="device",
+                resource_id=device.id,
+                metadata={"name": device.name},
+            )
+        self.session.commit()
+        self.session.refresh(device)
+        return self._to_device_response(device)
+
+    def allow_device_reregistration(
+        self,
+        *,
+        actor: User,
+        organization_id: uuid.UUID,
+        device_id: uuid.UUID,
+    ) -> DeviceResponse:
+        """Let this hardware register again with a registration token, for a limited time.
+
+        Needed after a card is re-flashed and the device lost its token; without it, a
+        registration token plus a known serial or MAC cannot take over the device record.
+        """
+        membership = self._require_membership(organization_id, actor.id)
+        device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.update", device_group_id=device.device_group_id)
+        window = timedelta(seconds=self.settings.device_reregistration_window_seconds)
+        device.reregistration_allowed_until = datetime.now(UTC) + window
+        self.devices.update(device)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device.reregistration_allowed",
+            resource_type="device",
+            resource_id=device.id,
+            metadata={"name": device.name, "until": device.reregistration_allowed_until.isoformat()},
+        )
         self.session.commit()
         self.session.refresh(device)
         return self._to_device_response(device)
@@ -729,12 +1179,20 @@ class FleetService:
         device_id: uuid.UUID,
     ) -> DeviceCredentialResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.update", device_group_id=device.device_group_id)
         generated = generate_device_token()
         device.credential_hash = generated.token_hash
         device.credential_prefix = generated.display_prefix
         self.devices.update(device)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device.credential.rotate",
+            resource_type="device",
+            resource_id=device.id,
+            metadata={"name": device.name, "credential_prefix": generated.display_prefix},
+        )
         self.session.commit()
         return DeviceCredentialResponse(
             device_id=device.id,
@@ -750,11 +1208,19 @@ class FleetService:
         device_id: uuid.UUID,
     ) -> DeviceResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.update", device_group_id=device.device_group_id)
         device.credential_hash = None
         device.credential_prefix = None
         self.devices.update(device)
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device.credential.revoke",
+            resource_type="device",
+            resource_id=device.id,
+            metadata={"name": device.name},
+        )
         self.session.commit()
         self.session.refresh(device)
         return self._to_device_response(device)
@@ -767,14 +1233,23 @@ class FleetService:
         device_id: uuid.UUID,
     ) -> DeviceResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
         device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.update", device_group_id=device.device_group_id)
         cred = self.session.get(DeviceMqttCredential, device_id)
         if cred is None:
             raise NotFoundError("mqtt_not_configured", "This device has no MQTT credential.")
         if cred.revoked_at is None:
             cred.revoked_at = datetime.now(UTC)
             self.session.add(cred)
+            self._mark_mqtt_offline(device)
+            self._record_audit(
+                actor=actor,
+                organization_id=organization_id,
+                action="device.mqtt_credential.revoke",
+                resource_type="device",
+                resource_id=device.id,
+                metadata={"name": device.name},
+            )
             self.session.commit()
         self.session.refresh(device)
         return self._to_device_response(device)
@@ -788,13 +1263,24 @@ class FleetService:
         publisher: MqttPublisher,
     ) -> DevicePingResponse:
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
-        self._require_device(organization_id, device_id)
-        return MqttService(self.session, settings=self.settings).send_ping(
+        device = self._require_device(organization_id, device_id)
+        self._require(membership, "device.reboot", device_group_id=device.device_group_id)
+        response = MqttService(self.session, settings=self.settings).send_ping(
             organization_id=organization_id,
             device_id=device_id,
             publisher=publisher,
         )
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="device.command.ping",
+            resource_type="device",
+            resource_id=device_id,
+            metadata={"name": device.name},
+            outcome="failure" if response.status == "failed" else "success",
+        )
+        self.session.commit()
+        return response
 
     def require_mqtt_listener(
         self,
@@ -828,7 +1314,7 @@ class FleetService:
         from app.mqtt.topics import validate_mqtt_topic
 
         membership = self._require_membership(organization_id, actor.id)
-        self._require_manage(membership.role)
+        self._require(membership, "mqtt.test")
         if device_id is not None:
             self._require_device(organization_id, device_id)
             resolved = topic or f"devices/{device_id}/events"
@@ -837,6 +1323,7 @@ class FleetService:
                 raise ValidationAppError("mqtt_topic_required", "A topic is required.")
             resolved = topic
         resolved = validate_mqtt_topic(resolved, allow_wildcards=False)
+        self._require_test_publish_topic_in_scope(organization_id, resolved)
         if isinstance(payload, dict):
             text = json.dumps(payload)
         elif payload is None:
@@ -850,7 +1337,39 @@ class FleetService:
                 "mqtt_unavailable",
                 "Could not publish to the MQTT broker.",
             ) from exc
+        self._record_audit(
+            actor=actor,
+            organization_id=organization_id,
+            action="mqtt.test_publish",
+            resource_type="mqtt_topic",
+            resource_id=str(device_id) if device_id is not None else None,
+            metadata={"topic": resolved[:255], "bytes": len(text.encode())},
+        )
+        self.session.commit()
         return MqttTestPublishResponse(topic=resolved, payload=text)
+
+    def _require_test_publish_topic_in_scope(self, organization_id: uuid.UUID, topic: str) -> None:
+        """Keep console test publishes inside the caller's organization.
+
+        The console publishes with the platform (superuser) identity, so the broker
+        does not check these topics. Block the platform control namespace and any
+        ``devices/{id}/...`` topic whose device is not in this organization.
+        """
+        from app.core.exceptions import ValidationAppError
+        from app.mqtt.policy import CONTROL_TOPIC_PREFIX
+
+        denied = ValidationAppError("mqtt_topic_invalid", "That MQTT topic is not allowed.")
+        if topic.startswith(CONTROL_TOPIC_PREFIX):
+            raise denied
+        parts = topic.split("/")
+        if parts[0] != "devices":
+            return
+        try:
+            target = uuid.UUID(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            target = None
+        if target is None or self.devices.get(organization_id=organization_id, device_id=target) is None:
+            raise denied
 
     def _require_device(self, organization_id: uuid.UUID, device_id: uuid.UUID) -> Device:
         device = self.devices.get(organization_id=organization_id, device_id=device_id)
@@ -878,14 +1397,18 @@ class FleetService:
             os_version=device.os_version,
             kernel_version=device.kernel_version,
             architecture=device.architecture,
+            hardware_model=device.hardware_model,
             cpu_model=device.cpu_model,
             cpu_cores=device.cpu_cores,
             memory_mb=device.memory_mb,
+            local_ip=device.local_ip,
+            agent_version=device.agent_version,
             labels=device.labels,
             metadata=device.metadata_,
             credential_prefix=device.credential_prefix,
             last_seen_at=device.last_seen_at,
             registered_at=device.registered_at,
+            reregistration_allowed_until=device.reregistration_allowed_until,
             created_at=device.created_at,
             updated_at=device.updated_at,
             mqtt_configured=self._mqtt_configured(device.id),

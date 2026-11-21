@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from edge_installer.config.models import INSTALLATION_NAME_PATTERN, InstallationConfig
 from edge_installer.exceptions import ConfigurationError
 from edge_installer.process.runner import command_exists
+from edge_installer.providers.aws.ssh_key import validate_ssh_key_matches_ec2
 
 REQUIRED_SECRET_VARS = (
-    "EDGE_PLATFORM_POSTGRES_PASSWORD",
     "EDGE_PLATFORM_JWT_SECRET",
 )
 
@@ -42,12 +44,6 @@ def validate_configuration(config: InstallationConfig) -> list[str]:
         if not config.network.allowed_ssh_cidrs:
             errors.append("network.allowed_ssh_cidrs must not be empty")
 
-    if provider == "gcp":
-        if config.gcp is None:
-            errors.append("gcp settings are required when installation.provider is gcp")
-        if config.services.vpn.enabled:
-            errors.append("services.vpn is not supported on GCP Cloud Run; set services.vpn.enabled=false")
-
     enabled_services = config.enabled_service_names()
     if not enabled_services:
         errors.append("At least one service must be enabled under services")
@@ -55,10 +51,31 @@ def validate_configuration(config: InstallationConfig) -> list[str]:
     if config.services.vpn.enabled and not config.services.cloud_app.enabled:
         errors.append("services.vpn requires services.cloud_app to be enabled")
 
+    # The API and the WireGuard gateway agent authenticate /internal/connectivity with it.
+    if config.services.vpn.enabled and not (
+        os.environ.get("EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN")
+        or os.environ.get("EDGE_PLATFORM_MQTT_INTERNAL_TOKEN")
+    ):
+        errors.append(
+            "EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN is not set (required by services.vpn)"
+        )
+
+    # Brokers send it in a URL query string (VerneMQ webhooks), so keep it URL-safe.
+    mqtt_token = os.environ.get("EDGE_PLATFORM_MQTT_INTERNAL_TOKEN")
+    if mqtt_token and not re.fullmatch(r"[A-Za-z0-9._~-]+", mqtt_token):
+        errors.append(
+            "EDGE_PLATFORM_MQTT_INTERNAL_TOKEN may only use letters, digits and . _ ~ -"
+        )
+
     if config.services.cloud_app.enabled:
-        if not config.components.postgres.enabled:
-            errors.append("components.postgres must be enabled when cloud_app is enabled")
-        if provider == "aws" and not config.components.reverse_proxy.enabled:
+        if config.components.postgres.enabled:
+            if not os.environ.get("EDGE_PLATFORM_POSTGRES_PASSWORD"):
+                errors.append("EDGE_PLATFORM_POSTGRES_PASSWORD is not set")
+        elif not os.environ.get("EDGE_PLATFORM_DATABASE_URL"):
+            errors.append(
+                "EDGE_PLATFORM_DATABASE_URL must be set when components.postgres is disabled"
+            )
+        if not config.components.reverse_proxy.enabled:
             errors.append("components.reverse_proxy must be enabled when cloud_app is enabled")
         if not config.deployment.backend_image.strip():
             errors.append("deployment.backend_image must be configured")
@@ -71,21 +88,58 @@ def validate_configuration(config: InstallationConfig) -> list[str]:
     if config.platform.domain and config.platform.public_url:
         errors.append("platform.domain and platform.public_url cannot both be set")
 
+    zone = (config.aws.dns_zone_id if config.aws else "") or ""
+    if zone.strip() and not (config.platform.domain or "").strip():
+        errors.append("aws.dns_zone_id requires platform.domain")
+    if (config.platform.domain or "").strip() and zone.strip() and config.aws is None:
+        errors.append("aws settings are required to create Route53 records")
+
     if config.observability.enabled and config.observability.backend == "cloudwatch":
         errors.append(
             "observability.backend=cloudwatch is not implemented yet; "
             "use backend=prometheus or set observability.enabled=false"
         )
+    if config.observability.enabled:
+        components = config.observability.components
+        if not components.enabled_names():
+            errors.append("observability.components: enable at least one component or set observability.enabled=false")
+        if components.alerting and not components.metrics:
+            errors.append("observability.components.alerting needs components.metrics (alerts are Prometheus rules)")
+        if components.dashboards and not (components.metrics or components.logs):
+            errors.append("observability.components.dashboards needs components.metrics or components.logs")
+        if components.dashboards and not os.environ.get("EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD", "").strip():
+            errors.append(
+                "EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD is required for observability.components.dashboards"
+            )
+        webhook = os.environ.get("EDGE_PLATFORM_ALERT_WEBHOOK_URL", "").strip()
+        if webhook and not _is_https_url(webhook):
+            errors.append("EDGE_PLATFORM_ALERT_WEBHOOK_URL must be an https:// URL with a host")
+        heartbeat = os.environ.get("EDGE_PLATFORM_ALERT_HEARTBEAT_URL", "").strip()
+        if heartbeat and not _is_https_url(heartbeat):
+            errors.append("EDGE_PLATFORM_ALERT_HEARTBEAT_URL must be an https:// URL with a host")
+        if heartbeat and not webhook:
+            errors.append("EDGE_PLATFORM_ALERT_HEARTBEAT_URL needs EDGE_PLATFORM_ALERT_WEBHOOK_URL")
 
     return errors
 
 
+def _is_https_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        parsed.port  # noqa: B018 - raises ValueError for a non-numeric or out-of-range port
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and bool(parsed.hostname)
+
+
 def validate_dependencies(config: InstallationConfig | None = None) -> list[str]:
     errors: list[str] = []
-    tools = ["terraform"]
-    if config is None or config.installation.provider == "aws":
-        tools.extend(["ansible-playbook", "ssh"])
-    for tool in tools:
+    from edge_installer.providers.aws.terraform import terraform_binary
+
+    terraform = terraform_binary()
+    if not command_exists(terraform):
+        errors.append(f"Required tool not found in PATH: {terraform} (install Terraform or OpenTofu)")
+    for tool in ("ansible-playbook", "ssh"):
         if not command_exists(tool):
             errors.append(f"Required tool not found in PATH: {tool}")
     return errors
@@ -105,29 +159,21 @@ def validate_aws_credentials(profile: str | None = None) -> list[str]:
     return []
 
 
-def validate_gcp_credentials() -> list[str]:
-    adc_env = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if adc_env:
-        path = Path(adc_env).expanduser()
-        if not path.exists():
-            return [f"GOOGLE_APPLICATION_CREDENTIALS does not exist: {path}"]
-        return []
-    adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
-    if adc.exists():
-        return []
-    return [
-        "GCP credentials are not configured "
-        "(gcloud auth application-default login or GOOGLE_APPLICATION_CREDENTIALS)"
-    ]
-
-
 def ensure_valid(config: InstallationConfig) -> None:
     errors = validate_configuration(config) + validate_dependencies(config)
-    if config.installation.provider == "aws":
-        profile = config.aws.profile if config.aws else None
-        errors.extend(validate_aws_credentials(profile))
-    elif config.installation.provider == "gcp":
-        errors.extend(validate_gcp_credentials())
+    profile = config.aws.profile if config.aws else None
+    errors.extend(validate_aws_credentials(profile))
+    if config.installation.provider == "aws" and config.aws is not None:
+        key_path = Path(config.aws.ssh_private_key_path).expanduser()
+        if key_path.exists():
+            errors.extend(
+                validate_ssh_key_matches_ec2(
+                    private_key_path=key_path,
+                    key_name=config.aws.ssh_key_name,
+                    region=config.aws.region,
+                    profile=profile,
+                )
+            )
     if errors:
         message = "Configuration is invalid:\n\n" + "\n".join(f"- {item}" for item in errors)
         raise ConfigurationError(message, stage="validation")

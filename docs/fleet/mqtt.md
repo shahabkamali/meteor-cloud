@@ -1,12 +1,18 @@
 # MQTT
 
-Devices connect to EMQX over **one-way TLS** with a per-device username and password and a strict topic ACL.
+Devices connect to the MQTT broker over **one-way TLS** with a per-device username and password and a strict topic ACL.
 
 ```text
 Registered device → authenticates to MQTT → publishes status/metrics → ping → pong
 ```
 
-Certificate-based device authentication (mTLS) is not implemented. Production AWS Ansible does not deploy EMQX; use local Compose or run the data-plane stack yourself. Cloud Run does not expose MQTT TCP 8883.
+Certificate-based device authentication (mTLS) is not implemented. MQTT is optional and off by default in every deployment path. Enable it with `mqtt_enabled: true` (Ansible), the `mqtt` and `mosquitto` Compose profiles, or `mqtt.enabled=true` (Helm), using the bundled broker or an external one. Devices need TCP 8883 reachable.
+
+## Choosing a broker
+
+The bundled broker is **Eclipse Mosquitto** by default. **EMQX 5.8.6** and **VerneMQ** are selectable with one setting (`MQTT_PROVIDER` and the Compose profile of the same name). All three ask the control plane for every login and topic permission, so the rules below are identical whichever one runs.
+
+How they differ (licence, clustering, patches), how each is wired, TLS, and how to switch: [MQTT brokers](mqtt-brokers.md). Licences: [Licensing](../licensing.md).
 
 ## Security model
 
@@ -15,7 +21,9 @@ Certificate-based device authentication (mTLS) is not implemented. Production AW
 | Per-device MQTT password | Each device has `device_<device_id>` / a random secret. The platform stores only the SHA-256 hash. The plaintext is returned **once** at registration/claim. |
 | Broker TLS (`mqtts://localhost:8883`) | Protects the password in transit. Devices verify `ca.crt`. |
 | Topic ACL | A device may publish only `status`, `metrics`, and `commands/result`, and subscribe only to `commands`. The platform MQTT user is a superuser for the Fleet MQTT test console. |
-| Revoke / disable | MQTT auth rejects disabled devices and revoked MQTT credentials (`POST .../devices/{id}/mqtt/revoke`). |
+| Revoke / disable | Disabled devices and revoked MQTT credentials (`POST .../devices/{id}/mqtt/revoke`) are refused at login and on every publish and subscribe. Mosquitto also disconnects the live session at once. |
+| Client ID | A device must connect as `device-<device_id>` or `device-<device_id>-<suffix>`, so it cannot take over another device's session. |
+| Retained messages | A device may retain only its own `status`. |
 | HTTP vs MQTT | The `dev_` HTTP token and the MQTT password are separate secrets. HTTP last-seen and MQTT online/offline are independent. |
 
 Internal broker callbacks:
@@ -38,7 +46,6 @@ make dev
 ```
 
 - MQTT TLS: `mqtts://localhost:8883`
-- EMQX dashboard (dev only): http://localhost:18083 (`admin` / `public`)
 - Port `1883` is not exposed.
 
 Then register a device (`meteorcli register` or request-token/claim). The agent
@@ -47,8 +54,9 @@ stores MQTT credentials in `mqtt.json` (`0600`) and `mqtt-ca.crt`. Start
 and answers ping.
 
 On the device detail page: **Test Connection** (ping), latest CPU/memory/disk
-snapshot, topics, and meteorcli examples. Open **MQTT test** in the sidebar for a
-free-form topic/payload console (platform credentials; any topic).
+snapshot, topics, and meteorcli examples. The organization MQTT test page
+(`/organizations/{id}/mqtt`) is still available by URL for a free-form
+topic/payload console (platform credentials; any topic).
 
 To publish a status probe from the Pi:
 
@@ -61,7 +69,7 @@ Register/claim must have written `~/.config/meteorcli/mqtt.json` first
 (`meteorcli status` should say `MQTT: configured`). `MQTT_PUBLIC_HOST` on the
 server must be reachable from the device (not `localhost` for a Pi on the LAN).
 `make mqtt-certs` includes this machine's LAN IP in the broker certificate;
-restart EMQX after generating certs so it loads the new files.
+restart the broker after generating certs so it loads the new files.
 
 To print inbound commands:
 
@@ -89,7 +97,7 @@ Subscribe (as the device):
 ```bash
 mosquitto_sub \
   -h localhost -p 8883 --cafile certs/ca.crt \
-  -u device_DEVICE_ID -P MQTT_PASSWORD \
+  -i device-DEVICE_ID-sub -u device_DEVICE_ID -P MQTT_PASSWORD \
   -t devices/DEVICE_ID/commands
 ```
 
@@ -98,12 +106,14 @@ Publish status:
 ```bash
 mosquitto_pub \
   -h localhost -p 8883 --cafile certs/ca.crt \
-  -u device_DEVICE_ID -P MQTT_PASSWORD \
+  -i device-DEVICE_ID-pub -u device_DEVICE_ID -P MQTT_PASSWORD \
   -t devices/DEVICE_ID/status \
   -m '{"status":"online"}'
 ```
 
-A second device username must be **denied** on `devices/OTHER_ID/#`.
+The broker rejects a device whose client id is not `device-DEVICE_ID` or
+`device-DEVICE_ID-<suffix>`. A second device username must be **denied** on
+`devices/OTHER_ID/#`.
 
 ## Topics
 

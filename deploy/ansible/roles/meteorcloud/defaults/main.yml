@@ -1,0 +1,261 @@
+---
+# Every MeteorCloud deployment setting and its default. Override in inventory
+# group_vars (see inventory/example/) or with extra-vars (edge-installer does this).
+# Secrets default to EDGE_PLATFORM_* environment variables on the Ansible
+# controller so nothing secret has to be written into the inventory.
+
+# Host layout
+platform_root: /opt/edge-platform
+platform_compose_dir: "{{ platform_root }}/compose"
+platform_source_dir: "{{ platform_root }}/src"
+platform_certs_dir: "{{ platform_root }}/certs"
+# Owner of the bundle and config files (the env file holds secrets, mode 0600).
+platform_owner: root
+# Compose project and network name; change only to run two stacks on one host.
+compose_project_name: meteorcloud
+
+# Public entry point (Traefik)
+http_port: 80
+https_port: 443
+
+# Application
+platform_env: production
+platform_version: "0.2.0"
+platform_public_url: http://127.0.0.1
+platform_domain: ""
+acme_email: "{{ EDGE_PLATFORM_ACME_EMAIL | default(lookup('env', 'EDGE_PLATFORM_ACME_EMAIL'), true) }}"
+log_format: console
+log_level: INFO
+# Empty = app default (access log on when log_format is json).
+access_log: ""
+metrics_enabled: true
+registration_require_https: false
+docs_public_url: http://localhost:3000/docs
+
+# Nightly backups (scripts/backup.sh, docs/backups.md): PostgreSQL, ClickHouse and
+# artifacts into {{ platform_root }}/backups, kept backup_retention_days days. Set
+# backup_s3_uri (s3://bucket/prefix) to also copy each backup off the host; give keys
+# here, since containers cannot use the EC2 instance role (metadata guard).
+backup_enabled: true
+backup_on_calendar: "*-*-* 03:15:00"
+backup_retention_days: 7
+backup_s3_uri: ""
+backup_s3_endpoint_url: ""
+backup_s3_region: ""
+backup_s3_access_key_id: "{{ EDGE_PLATFORM_BACKUP_S3_ACCESS_KEY_ID | default(lookup('env', 'EDGE_PLATFORM_BACKUP_S3_ACCESS_KEY_ID'), true) }}"
+backup_s3_secret_access_key: "{{ EDGE_PLATFORM_BACKUP_S3_SECRET_ACCESS_KEY | default(lookup('env', 'EDGE_PLATFORM_BACKUP_S3_SECRET_ACCESS_KEY'), true) }}"
+backup_s3_session_token: "{{ EDGE_PLATFORM_BACKUP_S3_SESSION_TOKEN | default(lookup('env', 'EDGE_PLATFORM_BACKUP_S3_SESSION_TOKEN'), true) }}"
+
+# Images. image_source=git clones repository_url and builds on the host;
+# image_source=archive copies platform_source_archive (a controller .tar.gz of the
+# repository, e.g. `git archive`) and builds on the host (private repos, air-gapped);
+# image_source=registry pulls the image references below.
+image_source: git
+platform_source_archive: ""
+repository_url: https://github.com/meteor-edge/meteor-cloud.git
+git_ref: master
+backend_image: edge-platform-backend:0.2.0
+# MQTT gateway (the "data-plane" Compose service, needs mqtt_enabled). go: the Go MQTT
+# forwarder from data_api_image (default). python: the previous Python gateway from
+# data_plane_image, kept as a fallback for one release.
+data_plane_gateway: go
+data_plane_image: edge-platform-data-plane:0.2.0
+# Application data API (Go). Off by default; enable for SDK publish/subscribe/query/commands.
+data_api_enabled: false
+data_api_image: meteorcloud/data-api:0.2.0
+data_plane_internal_token: "{{ EDGE_PLATFORM_DATA_PLANE_INTERNAL_TOKEN | default(lookup('env', 'EDGE_PLATFORM_DATA_PLANE_INTERNAL_TOKEN'), true) }}"
+# memory: single replica, no MQTT bus required. mqtt: fan-out via the broker (needs mqtt_enabled).
+dataplane_bus: memory
+# postgres: events and commands in PostgreSQL (default; no clickhouse profile). clickhouse: events in
+# ClickHouse (needs the clickhouse Compose profile and CLICKHOUSE_PASSWORD / dataplane_clickhouse_*).
+dataplane_storage: postgres
+clickhouse_password: "{{ EDGE_PLATFORM_CLICKHOUSE_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_CLICKHOUSE_PASSWORD'), true) }}"
+dataplane_clickhouse_url: http://clickhouse:8123
+# Device event path (MQTT → NATS JetStream → rule-processor / clickhouse-writer). Needs mqtt_enabled
+# and ClickHouse (dataplane_storage=clickhouse). Off by default.
+nats_enabled: false
+nats_ingest_password: "{{ EDGE_PLATFORM_NATS_INGEST_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_NATS_INGEST_PASSWORD'), true) }}"
+nats_rules_password: "{{ EDGE_PLATFORM_NATS_RULES_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_NATS_RULES_PASSWORD'), true) }}"
+nats_chwriter_password: "{{ EDGE_PLATFORM_NATS_CHWRITER_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_NATS_CHWRITER_PASSWORD'), true) }}"
+nats_admin_password: "{{ EDGE_PLATFORM_NATS_ADMIN_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_NATS_ADMIN_PASSWORD'), true) }}"
+# Bundled Mosquitto broker with the MeteorCloud auth plugin (mqtt_provider=mosquitto).
+mosquitto_image: edge-platform-mosquitto:0.2.0
+frontend_image: edge-platform-frontend:0.2.0
+image_pull_policy: if-not-present
+
+# PostgreSQL: bundled (container on this host) or external (set external_database_url)
+postgres_provider: bundled
+postgres_database: edge_platform
+postgres_username: edge_platform
+postgres_password: "{{ EDGE_PLATFORM_POSTGRES_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_POSTGRES_PASSWORD'), true) }}"
+external_database_url: "{{ EDGE_PLATFORM_DATABASE_URL | default(lookup('env', 'EDGE_PLATFORM_DATABASE_URL'), true) }}"
+
+# Rate limiting: memory is enough for one API process on one host; use redis
+# (bundled or external) when several API processes share the limits.
+cache_provider: memory
+redis_provider: bundled
+external_redis_url: "{{ EDGE_PLATFORM_REDIS_URL | default(lookup('env', 'EDGE_PLATFORM_REDIS_URL'), true) }}"
+
+# Artifact storage: filesystem ({{ platform_root }}/data/artifacts) or s3 (AWS S3 or
+# any S3-compatible service). minio_enabled runs a bundled MinIO for the s3 provider.
+object_storage_provider: filesystem
+minio_enabled: false
+object_storage_endpoint_url: ""
+# Address devices download artifacts from through presigned URLs. Not needed for AWS S3;
+# empty with another endpoint (or with filesystem storage) streams downloads via the API.
+object_storage_public_endpoint_url: ""
+object_storage_region: us-east-1
+object_storage_bucket: meteorcloud-artifacts
+object_storage_auto_create_bucket: true
+object_storage_access_key_id: "{{ EDGE_PLATFORM_OBJECT_STORAGE_ACCESS_KEY_ID | default(lookup('env', 'EDGE_PLATFORM_OBJECT_STORAGE_ACCESS_KEY_ID'), true) }}"
+object_storage_secret_access_key: >-
+  {{ EDGE_PLATFORM_OBJECT_STORAGE_SECRET_ACCESS_KEY | default(lookup('env', 'EDGE_PLATFORM_OBJECT_STORAGE_SECRET_ACCESS_KEY'), true) }}
+
+# MQTT device connectivity (data plane). mqtt_broker: bundled or external.
+mqtt_enabled: false
+mqtt_broker: bundled
+# Broker software: mosquitto (default) | emqx | vernemq. With mqtt_broker=external
+# it tells MeteorCloud what your broker is. See docs/fleet/mqtt.md and docs/licensing.md.
+mqtt_provider: mosquitto
+# Only for mqtt_provider=vernemq with the official image: you accept the VerneMQ EULA.
+vernemq_accept_eula: "no"
+mqtt_broker_host: emqx
+mqtt_broker_port: 8883
+mqtt_public_host: "{{ platform_domain if platform_domain else ansible_host | default(inventory_hostname) }}"
+# Controller directory with ca.crt, server.crt, server.key for the bundled broker.
+# Empty: a self-signed CA is generated on the host once (devices receive the CA
+# from the control plane when they register).
+mqtt_certs_src_dir: ""
+mqtt_platform_password: "{{ EDGE_PLATFORM_MQTT_PLATFORM_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_MQTT_PLATFORM_PASSWORD'), true) }}"
+mqtt_internal_token: "{{ EDGE_PLATFORM_MQTT_INTERNAL_TOKEN | default(lookup('env', 'EDGE_PLATFORM_MQTT_INTERNAL_TOKEN'), true) }}"
+
+# Observability (Prometheus, Loki, Grafana on this host; UIs bind to localhost)
+observability_enabled: false
+observability_backend: prometheus
+grafana_admin_user: admin
+grafana_admin_password: "{{ EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD'), true) }}"
+# Which observability components run (Compose profiles), comma-separated. Drop one to turn it off;
+# the platform never depends on them. metrics: prometheus + node-exporter, logs: loki + alloy,
+# alerting: alertmanager, dashboards: grafana.
+observability_components: "metrics,logs,alerting,dashboards"
+# Retention: logs (Loki) and metrics (Prometheus, by time and by size, whichever is hit first).
+observability_log_retention: 168h
+observability_metrics_retention_time: 15d
+observability_metrics_retention_size: 5GB
+# Alertmanager delivers every alert to this webhook when set (secret, from the environment).
+# Empty: alerts are only visible in Alertmanager (127.0.0.1:9093).
+observability_alert_webhook_url: "{{ EDGE_PLATFORM_ALERT_WEBHOOK_URL | default(lookup('env', 'EDGE_PLATFORM_ALERT_WEBHOOK_URL'), true) }}"
+# Dead-man's-switch URL that receives the always-firing Watchdog every 5 minutes (secret, from
+# the environment). Needs the webhook above. The heartbeat service alerts you when it stops,
+# which also covers this host going down. Empty: no heartbeat.
+observability_alert_heartbeat_url: "{{ EDGE_PLATFORM_ALERT_HEARTBEAT_URL | default(lookup('env', 'EDGE_PLATFORM_ALERT_HEARTBEAT_URL'), true) }}"
+# Use an external backend instead of a bundled one (empty = bundled service).
+observability_prometheus_url: ""
+observability_loki_url: ""
+observability_loki_push_url: ""
+
+# Other secrets
+jwt_secret: "{{ EDGE_PLATFORM_JWT_SECRET | default(lookup('env', 'EDGE_PLATFORM_JWT_SECRET'), true) }}"
+admin_email: "{{ EDGE_PLATFORM_ADMIN_EMAIL | default(lookup('env', 'EDGE_PLATFORM_ADMIN_EMAIL'), true) }}"
+admin_password: "{{ EDGE_PLATFORM_ADMIN_PASSWORD | default(lookup('env', 'EDGE_PLATFORM_ADMIN_PASSWORD'), true) }}"
+demo_data: false
+
+# Host firewall (UFW). Off by default: cloud security groups usually do this.
+firewall_enabled: false
+firewall_ssh_port: 22
+firewall_allowed_ssh_cidrs: ["0.0.0.0/0"]
+
+# Device WireGuard gateway (the `vpn` service, or playbooks/wireguard.yml).
+# Where wg0 runs is chosen by the inventory:
+#   - `platform` only: on the API host (co-located).
+#   - `vpn_gateway` + `platform`: on a dedicated server (AWS, on-prem); each API
+#     host is joined to it by an automatic WireGuard site link (vpn_link_subnet).
+#   - `vpn_gateway` only: the control plane runs elsewhere (another cloud,
+#     Kubernetes). Set vpn_control_plane_url and vpn_site_links / vpn_routed_cidrs.
+# connectivity_provider and wireguard_server_public_key are filled in from the
+# gateway on managed API hosts; they stay "none"/empty until it is set up.
+connectivity_provider: none
+wireguard_server_public_key: "{{ lookup('env', 'EDGE_PLATFORM_VPN_SERVER_PUBLIC_KEY') | default('', true) }}"
+# host:port devices dial. Empty: vpn_public_host of the gateway host (else ansible_host) and vpn_listen_port.
+wireguard_server_endpoint: ""
+# Server private key. Empty: generate one on the gateway once (/etc/wireguard/server.key, never leaves the host).
+vpn_server_private_key: "{{ lookup('env', 'EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY') | default('', true) }}"
+vpn_generate_server_key: true
+vpn_listen_port: 51820
+vpn_server_address: 10.8.0.1/16
+vpn_network_cidr: 10.8.0.0/16
+# Automatic site links to managed API hosts; must not overlap vpn_network_cidr.
+# API host N (order in the `platform` group) gets .N+2 and serves the API to the gateway there.
+vpn_link_subnet: 10.9.0.0/24
+# Address the API hosts dial for the site link. Empty: the device endpoint.
+# Set the gateway's private ip:port when both are in one VPC or LAN.
+vpn_link_endpoint: ""
+# Control plane hosted elsewhere (`vpn_gateway` only): private URL the gateway agent polls for
+# /internal/connectivity/* (e.g. an internal load balancer or http://10.0.1.5:8000). Traefik never
+# serves /internal publicly. Overrides the derived URL in the other modes.
+vpn_control_plane_url: ""
+# Site links for unmanaged control-plane hosts: [{name, public_key, address}] with an address
+# inside vpn_link_subnet. Generate the key on that host; playbooks/wireguard.yml writes its config.
+vpn_site_links: []
+# Private source networks routed to the gateway without a tunnel (e.g. the VPC or EKS pod CIDR).
+# They may open connections to devices and are NATed to the server address. AWS: disable the
+# gateway's source/dest check and route vpn_network_cidr to its ENI.
+vpn_routed_cidrs: []
+# Derived; do not set.
+vpn_standalone: "{{ groups['vpn_gateway'] | default([]) | length > 0 }}"
+vpn_managed_api_hosts: "{{ groups['platform'] | default([]) if vpn_standalone | bool else [] }}"
+vpn_gateway_hosts: "{{ groups['vpn_gateway'] if vpn_standalone | bool else groups['platform'] | default([]) }}"
+vpn_gateway_host: "{{ vpn_gateway_hosts | first if vpn_standalone | bool else inventory_hostname }}"
+vpn_gateway_endpoint: >-
+  {{ wireguard_server_endpoint
+     or (hostvars[vpn_gateway_host].vpn_public_host | default(hostvars[vpn_gateway_host].ansible_host | default(vpn_gateway_host)))
+        ~ ':' ~ vpn_listen_port }}
+vpn_link_prefix: "{{ vpn_link_subnet.split('/')[0].split('.')[:3] | join('.') }}"
+vpn_agent_control_plane_url: >-
+  {{ vpn_control_plane_url
+     or ('http://' ~ vpn_link_prefix ~ '.2:8000' if vpn_managed_api_hosts | length > 0 else 'http://127.0.0.1:8000') }}
+# Controller directory for playbooks/wireguard.yml's control-plane settings (gitignored).
+vpn_handoff_dir: "{{ playbook_dir }}/../artifacts/wireguard-{{ vpn_gateway_host }}"
+vpn_api_bind_address: >-
+  {{ (vpn_link_prefix ~ '.' ~ (vpn_managed_api_hosts.index(inventory_hostname) + 2))
+     if inventory_hostname in vpn_managed_api_hosts else '127.0.0.1' }}
+connectivity_internal_token: >-
+  {{ EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN
+     | default(lookup('env', 'EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN'), true)
+     | default(mqtt_internal_token, true) }}
+routing_internal_token: >-
+  {{ EDGE_PLATFORM_ROUTING_INTERNAL_TOKEN
+     | default(lookup('env', 'EDGE_PLATFORM_ROUTING_INTERNAL_TOKEN'), true)
+     | default(connectivity_internal_token, true) }}
+apps_base_domain: "{{ platform_domain | default('meteor-edge.com', true) }}"
+# Browser SSH. On with WireGuard: Ansible creates the gateway SSH key on the API
+# host once (shell_ssh_dir), mounts it into the API, and devices install its public key.
+# The platform private key stays 0600 (OpenSSH rejects 0640). meteorcloud-ssh uses a
+# personal 0600 copy. Override with shell_provider: none to keep the tunnel only.
+shell_provider: "{{ 'ssh_gateway' if 'vpn' in enabled_services else 'none' }}"
+shell_ssh_dir: "{{ platform_root }}/shell"
+shell_ssh_identity_file: "{{ '/run/meteorcloud/shell/id_ed25519' if shell_provider == 'ssh_gateway' else '' }}"
+shell_gateway_public_key: ""
+# SSH user CA next to the gateway key: every browser or meteorcloud-ssh session gets a fresh
+# key and a certificate valid for one device for a couple of minutes. Agents that trust it
+# report ssh_auth=ca; the others keep using the shared key until shell_gateway_key_retired.
+shell_ssh_ca_enabled: true
+shell_ssh_ca_file: "{{ '/run/meteorcloud/shell/ca' if shell_provider == 'ssh_gateway' and shell_ssh_ca_enabled | bool else '' }}"
+shell_ssh_ca_public_key: ""
+# Phase 2, once every device shows "SSH auth: certificate": stop sending the shared key
+# (agents remove it from authorized_keys) and delete the operator copies.
+shell_gateway_key_retired: false
+# Extra login names that receive ~/.config/meteorcloud/shell/id_ed25519.
+# ansible_user, ubuntu, and debian are always included when those accounts exist.
+shell_ssh_operator_users: []
+# Region for Traefik's Route53 DNS-01 (wildcard app certificates). Credentials come from the
+# instance role (IMDSv2, hop limit 2) or, off AWS, a scoped IAM key from the controller env.
+traefik_aws_region: ""
+traefik_aws_access_key_id: "{{ lookup('env', 'EDGE_PLATFORM_TRAEFIK_AWS_ACCESS_KEY_ID') }}"
+traefik_aws_secret_access_key: "{{ lookup('env', 'EDGE_PLATFORM_TRAEFIK_AWS_SECRET_ACCESS_KEY') }}"
+
+# Services selected by edge-installer; standalone runs deploy the application only.
+enabled_services: [cloud_app]
+
+# Destroy: also delete {{ platform_root }} (database, artifacts, certificates).
+platform_destroy_data: false

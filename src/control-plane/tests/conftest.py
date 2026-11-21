@@ -7,6 +7,21 @@ import uuid
 from collections.abc import Generator
 
 os.environ["MQTT_ENABLED"] = "false"
+# Tests call sweep_deployments directly; no background sweeper against the test DB.
+os.environ["DEPLOY_TICK_INTERVAL_SECONDS"] = "0"
+# No registry lookups from tests; test_release_image_digest.py enables them with a fake.
+os.environ.setdefault("RELEASE_RESOLVE_IMAGE_DIGESTS", "false")
+os.environ.setdefault("CONNECTIVITY_PROVIDER", "wireguard")
+os.environ.setdefault("SHELL_PROVIDER", "echo")
+os.environ.setdefault(
+    "WIREGUARD_SERVER_PUBLIC_KEY",
+    "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+)
+os.environ.setdefault("WIREGUARD_SERVER_ENDPOINT", "127.0.0.1:51820")
+os.environ.setdefault("APPS_BASE_DOMAIN", "meteor-edge.com")
+os.environ.setdefault("CONNECTIVITY_INTERNAL_TOKEN", "test-connectivity-internal")
+if not os.environ.get("DATA_PLANE_INTERNAL_TOKEN"):  # also when it is set but empty
+    os.environ["DATA_PLANE_INTERNAL_TOKEN"] = "test-data-plane-internal"
 
 import pytest
 from fastapi.testclient import TestClient
@@ -14,24 +29,45 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 # Ensure metadata includes domain models.
+from app.applications import models as _application_models  # noqa: F401
+from app.artifacts import models as _artifact_models  # noqa: F401
+from app.artifacts.dependencies import get_object_storage, get_public_os_image_rate_limiter
 from app.audit import models as _audit_models  # noqa: F401
+from app.authorization import models as _authorization_models  # noqa: F401
+from app.authorization.roles import get_system_role_id
+from app.authorization.seed import seed_authorization_catalog
+from app.connectivity import models as _connectivity_models  # noqa: F401
+from app.connectivity.dependencies import get_connectivity_rate_limiter
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.core.models import Base
 from app.core.security import hash_password
+from app.deployments import models as _deployment_models  # noqa: F401
+from app.deployments import software_models as _software_models  # noqa: F401
 from app.devices import models as _fleet_models  # noqa: F401
 from app.devices.dependencies import (
+    get_enroll_ip_rate_limiter,
+    get_enroll_poll_ip_rate_limiter,
     get_enroll_poll_rate_limiter,
     get_enroll_request_rate_limiter,
     get_rate_limiter,
 )
 from app.devices.rate_limit import InMemoryRateLimiter
+from app.endpoints import models as _endpoint_models  # noqa: F401
+from app.history import models as _history_models  # noqa: F401
 from app.identity import models as _identity_models  # noqa: F401
+from app.identity.dependencies import get_login_email_rate_limiter, get_login_ip_rate_limiter
 from app.identity.models import User
 from app.main import create_app
+from app.network import models as _network_models  # noqa: F401
+from app.releases import models as _release_models  # noqa: F401
+from app.shell import models as _shell_models  # noqa: F401
+from app.signing import models as _signing_models  # noqa: F401
 from app.tenancy import models as _organization_models  # noqa: F401
 from app.tenancy.models import Organization, OrganizationMembership, OrganizationRole
+from tests.agent_contract import check_response as check_agent_contract
 from tests.db_guard import assert_safe_test_database_url, ensure_database_exists
+from tests.storage import InMemoryObjectStorage
 
 
 @pytest.fixture(scope="session")
@@ -42,6 +78,9 @@ def engine():
     eng = create_engine(settings.database_url, pool_pre_ping=True)
     Base.metadata.drop_all(bind=eng)
     Base.metadata.create_all(bind=eng)
+    with Session(eng) as session:
+        seed_authorization_catalog(session)
+        session.commit()
     yield eng
     eng.dispose()
 
@@ -59,6 +98,8 @@ def db_session(engine) -> Generator[Session]:
 
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     session = TestingSessionLocal()
+    seed_authorization_catalog(session)
+    session.commit()
     try:
         yield session
     finally:
@@ -69,7 +110,12 @@ def db_session(engine) -> Generator[Session]:
 
 
 @pytest.fixture
-def client(db_session: Session) -> Generator[TestClient]:
+def object_storage() -> InMemoryObjectStorage:
+    return InMemoryObjectStorage()
+
+
+@pytest.fixture
+def client(db_session: Session, object_storage: InMemoryObjectStorage) -> Generator[TestClient]:
     application = create_app()
 
     def override_get_db() -> Generator[Session]:
@@ -79,16 +125,37 @@ def client(db_session: Session) -> Generator[TestClient]:
             pass
 
     application.dependency_overrides[get_db] = override_get_db
+    application.dependency_overrides[get_object_storage] = lambda: object_storage
     # Permissive limiter by default; tests that exercise rate limiting override
     # this on ``client.app.dependency_overrides``.
     application.dependency_overrides[get_rate_limiter] = lambda: InMemoryRateLimiter(limit=10_000, window_seconds=60)
+    application.dependency_overrides[get_login_email_rate_limiter] = lambda: InMemoryRateLimiter(
+        limit=10_000, window_seconds=60
+    )
+    application.dependency_overrides[get_login_ip_rate_limiter] = lambda: InMemoryRateLimiter(
+        limit=10_000, window_seconds=60
+    )
     application.dependency_overrides[get_enroll_request_rate_limiter] = lambda: InMemoryRateLimiter(
         limit=10_000, window_seconds=60
     )
     application.dependency_overrides[get_enroll_poll_rate_limiter] = lambda: InMemoryRateLimiter(
         limit=10_000, window_seconds=60
     )
+    application.dependency_overrides[get_enroll_ip_rate_limiter] = lambda: InMemoryRateLimiter(
+        limit=10_000, window_seconds=60
+    )
+    application.dependency_overrides[get_enroll_poll_ip_rate_limiter] = lambda: InMemoryRateLimiter(
+        limit=10_000, window_seconds=60
+    )
+    application.dependency_overrides[get_connectivity_rate_limiter] = lambda: InMemoryRateLimiter(
+        limit=10_000, window_seconds=60
+    )
+    application.dependency_overrides[get_public_os_image_rate_limiter] = lambda: InMemoryRateLimiter(
+        limit=10_000, window_seconds=60
+    )
     with TestClient(application) as test_client:
+        # Every /api/v1/agent/* answer is checked against contracts/schemas/agent.
+        test_client.event_hooks["response"].append(check_agent_contract)
         yield test_client
     application.dependency_overrides.clear()
 
@@ -143,7 +210,7 @@ def create_org_with_owner(
     membership = OrganizationMembership(
         organization_id=organization.id,
         user_id=owner.id,
-        role=OrganizationRole.OWNER,
+        role_id=get_system_role_id(session, OrganizationRole.OWNER.value),
     )
     session.add(membership)
     session.commit()
@@ -161,7 +228,7 @@ def add_member(
     membership = OrganizationMembership(
         organization_id=organization.id,
         user_id=user.id,
-        role=role,
+        role_id=get_system_role_id(session, role.value),
     )
     session.add(membership)
     session.commit()

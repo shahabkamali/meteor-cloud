@@ -1,0 +1,312 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import type { ApplicationEndpoint, DeviceSoftware } from "@/api/fleet";
+import { DeviceSoftwarePanel } from "@/components/fleet/DeviceSoftwarePanel";
+
+vi.mock("@/api/fleet", async () => {
+  const actual = await vi.importActual<typeof import("@/api/fleet")>("@/api/fleet");
+  return {
+    ...actual,
+    listDeviceSoftware: vi.fn(),
+    listEndpoints: vi.fn(),
+  };
+});
+
+import { listDeviceSoftware, listEndpoints } from "@/api/fleet";
+
+const listMock = vi.mocked(listDeviceSoftware);
+const endpointsMock = vi.mocked(listEndpoints);
+
+function renderPanel(props: { deviceOnline?: boolean; onViewLogs?: () => void } = {}) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={client}>
+      <DeviceSoftwarePanel token="t" organizationId="org-1" deviceId="dev-1" {...props} />
+    </QueryClientProvider>,
+  );
+}
+
+function inSyncRow(overrides: Partial<DeviceSoftware> = {}): DeviceSoftware {
+  return {
+    id: "sw-1",
+    organization_id: "org-1",
+    device_id: "dev-1",
+    workload_key: "app",
+    kind: "docker",
+    desired_release_id: "rel-1",
+    desired_revision: 1,
+    desired_spec: {},
+    desired_release: { id: "rel-1", name: "app", version: "2.0", kind: "docker" },
+    installed_release_id: "rel-1",
+    installed_version: "2.0",
+    installed_release: { id: "rel-1", name: "app", version: "2.0", kind: "docker" },
+    health: "healthy",
+    sync_status: "in_sync",
+    progress_percent: 100,
+    attempt_count: 1,
+    last_error: null,
+    reported_at: new Date(Date.now() - 5_000).toISOString(),
+    created_at: "2026-10-16T12:00:00Z",
+    updated_at: "2026-10-16T12:00:00Z",
+    ...overrides,
+  };
+}
+
+function endpoint(overrides: Partial<ApplicationEndpoint> = {}): ApplicationEndpoint {
+  return {
+    id: "ep-1",
+    organization_id: "org-1",
+    device_id: "dev-1",
+    deployment_id: null,
+    device_software_id: null,
+    workload_key: "app",
+    hostname: "shop.acme.example.com",
+    protocol: "http",
+    port: 80,
+    enabled: true,
+    availability: "ready",
+    public_url: "https://shop.acme.example.com",
+    upstream_url: null,
+    created_at: "2026-10-16T12:00:00Z",
+    updated_at: "2026-10-16T12:00:00Z",
+    ...overrides,
+  };
+}
+
+describe("DeviceSoftwarePanel", () => {
+  beforeEach(() => {
+    listMock.mockReset();
+    endpointsMock.mockReset();
+    endpointsMock.mockResolvedValue([]);
+  });
+
+  it("links to the app when its address is available", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    endpointsMock.mockResolvedValue([endpoint()]);
+    renderPanel();
+    const link = await screen.findByRole("link", { name: "shop.acme.example.com" });
+    expect(link).toHaveAttribute("href", "https://shop.acme.example.com");
+    expect(link).toHaveAttribute("target", "_blank");
+  });
+
+  it("matches an address by software row when it has no workload key", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    endpointsMock.mockResolvedValue([endpoint({ workload_key: null, device_software_id: "sw-1" })]);
+    renderPanel();
+    expect(await screen.findByRole("link", { name: "shop.acme.example.com" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["not ready", { availability: "offline" }],
+    ["disabled", { enabled: false }],
+    ["for another app", { workload_key: "other" }],
+  ])("shows no link for an address that is %s", async (_label, overrides) => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    endpointsMock.mockResolvedValue([endpoint(overrides)]);
+    renderPanel();
+    expect(await screen.findByRole("table")).toBeInTheDocument();
+    await waitFor(() => expect(endpointsMock).toHaveBeenCalled());
+    await new Promise((resolve) => setTimeout(resolve));
+    expect(screen.queryByRole("link", { name: "shop.acme.example.com" })).not.toBeInTheDocument();
+  });
+
+  it("still lists software when addresses cannot be loaded", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    endpointsMock.mockRejectedValue(new Error("forbidden"));
+    renderPanel();
+    expect(await screen.findByRole("table")).toBeInTheDocument();
+    expect(screen.getByText("app")).toBeInTheDocument();
+  });
+
+  it("shows empty state when no software is assigned", async () => {
+    listMock.mockResolvedValue([]);
+    renderPanel();
+    expect(await screen.findByText(/no software assigned/i)).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /deploy a release/i })).not.toBeInTheDocument();
+  });
+
+  it("shows deploy CTA when canDeploy is set", async () => {
+    listMock.mockResolvedValue([]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <DeviceSoftwarePanel token="t" organizationId="org-1" deviceId="dev-1" canDeploy />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("link", { name: /deploy a release/i })).toHaveAttribute(
+      "href",
+      "/organizations/org-1/deployments?deploy=1&device_id=dev-1",
+    );
+  });
+
+  it("keeps the deploy button when the device already has software", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <DeviceSoftwarePanel token="t" organizationId="org-1" deviceId="dev-1" canDeploy />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole("link", { name: /deploy a release/i })).toHaveAttribute(
+      "href",
+      "/organizations/org-1/deployments?deploy=1&device_id=dev-1",
+    );
+  });
+
+  it("hides the deploy button above the table without deploy permission", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    renderPanel();
+    expect(await screen.findByRole("table")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /deploy a release/i })).not.toBeInTheDocument();
+  });
+
+  it("lists desired vs installed releases", async () => {
+    listMock.mockResolvedValue([
+      {
+        id: "sw-1",
+        organization_id: "org-1",
+        device_id: "dev-1",
+        workload_key: "camera-agent.service",
+        kind: "systemd",
+        desired_release_id: "rel-1",
+        desired_revision: 1,
+        desired_spec: {},
+        desired_release: {
+          id: "rel-1",
+          name: "camera-agent",
+          version: "1.2.0",
+          kind: "systemd",
+        },
+        installed_release_id: null,
+        installed_version: null,
+        installed_release: null,
+        health: "unknown",
+        sync_status: "pending",
+        progress_percent: 0,
+        attempt_count: 0,
+        last_error: null,
+        reported_at: null,
+        created_at: "2026-10-16T12:00:00Z",
+        updated_at: "2026-10-16T12:00:00Z",
+      },
+    ]);
+    renderPanel();
+    expect(await screen.findByText("camera-agent.service")).toBeInTheDocument();
+    expect(screen.getByText("camera-agent 1.2.0")).toBeInTheDocument();
+    expect(screen.getByText("Pending")).toBeInTheDocument();
+  });
+
+  it("shows updating progress percent", async () => {
+    listMock.mockResolvedValue([
+      {
+        id: "sw-1",
+        organization_id: "org-1",
+        device_id: "dev-1",
+        workload_key: "camera-agent.service",
+        kind: "systemd",
+        desired_release_id: "rel-1",
+        desired_revision: 1,
+        desired_spec: {},
+        desired_release: {
+          id: "rel-1",
+          name: "camera-agent",
+          version: "1.2.0",
+          kind: "systemd",
+        },
+        installed_release_id: null,
+        installed_version: null,
+        installed_release: null,
+        health: "unknown",
+        sync_status: "updating",
+        progress_percent: 42,
+        attempt_count: 1,
+        last_error: null,
+        reported_at: null,
+        created_at: "2026-10-16T12:00:00Z",
+        updated_at: "2026-10-16T12:00:00Z",
+      },
+    ]);
+    renderPanel();
+    expect(await screen.findByText("Updating (42%)")).toBeInTheDocument();
+  });
+
+  it("shows last_error on failed sync", async () => {
+    listMock.mockResolvedValue([
+      {
+        id: "sw-1",
+        organization_id: "org-1",
+        device_id: "dev-1",
+        workload_key: "camera-agent.service",
+        kind: "systemd",
+        desired_release_id: "rel-1",
+        desired_revision: 1,
+        desired_spec: {},
+        desired_release: {
+          id: "rel-1",
+          name: "camera-agent",
+          version: "1.2.0",
+          kind: "systemd",
+        },
+        installed_release_id: null,
+        installed_version: null,
+        installed_release: null,
+        health: "unhealthy",
+        sync_status: "failed",
+        progress_percent: 0,
+        attempt_count: 1,
+        last_error: "Downloaded artifact failed SHA-256 verification.",
+        reported_at: null,
+        created_at: "2026-10-16T12:00:00Z",
+        updated_at: "2026-10-16T12:00:00Z",
+      },
+    ]);
+    renderPanel();
+    expect(await screen.findByText(/SHA-256 verification/i)).toBeInTheDocument();
+  });
+
+  it("shows health as a badge with when it was reported", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    renderPanel();
+    expect(await screen.findByText("Healthy")).toBeInTheDocument();
+    expect(screen.getByText("In sync")).toBeInTheDocument();
+    expect(screen.getByText("reported just now")).toBeInTheDocument();
+  });
+
+  it("marks health stale when the device is offline", async () => {
+    listMock.mockResolvedValue([inSyncRow()]);
+    renderPanel({ deviceOnline: false });
+    expect(await screen.findByText("Stale")).toBeInTheDocument();
+    expect(screen.queryByText("Healthy")).not.toBeInTheDocument();
+  });
+
+  it("links an unhealthy workload to the Logs section on the page", async () => {
+    listMock.mockResolvedValue([
+      inSyncRow({
+        health: "unhealthy",
+        last_error: "container app is not running (exited, exit 1)",
+      }),
+    ]);
+    const onViewLogs = vi.fn();
+    renderPanel({ onViewLogs });
+
+    const link = await screen.findByRole("link", { name: "View logs" });
+    expect(link).toHaveAttribute("href", "#device-logs");
+    fireEvent.click(link);
+    expect(onViewLogs).toHaveBeenCalledOnce();
+    expect(screen.getByText("Unhealthy")).toBeInTheDocument();
+  });
+
+  it("has no logs link when the user cannot view logs", async () => {
+    listMock.mockResolvedValue([inSyncRow({ health: "unhealthy", last_error: "down" })]);
+    renderPanel();
+    expect(await screen.findByText("Unhealthy")).toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: "View logs" })).not.toBeInTheDocument();
+  });
+});

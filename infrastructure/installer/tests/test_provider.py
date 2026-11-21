@@ -12,7 +12,6 @@ from edge_installer.config.loader import load_configuration
 from edge_installer.process.runner import ProcessResult, redact
 from edge_installer.providers.aws.outputs import TerraformOutputs
 from edge_installer.providers.aws.terraform import TerraformRunner
-from edge_installer.providers.gcp.terraform import GcpTerraformRunner
 
 EXAMPLE = (
     Path(__file__).resolve().parent.parent
@@ -31,6 +30,12 @@ def test_terraform_variables_include_tags(tmp_path: Path) -> None:
     assert variables["installation_name"] == "production"
     assert variables["aws_region"] == "eu-central-1"
     assert variables["tags"]["ManagedBy"] == "edge-installer"
+    assert variables["vpn_placement"] == "same_host"
+    assert variables["vpn_instance_type"] == "t3.micro"
+    assert variables["instance_type"] == "t3.medium"
+    assert int(variables["root_volume_size_gb"]) >= 40
+    assert variables["platform_domain"] == ""
+    assert variables["dns_zone_id"] == ""
 
 
 def test_terraform_output_parsing() -> None:
@@ -78,22 +83,30 @@ def test_missing_output_raises_validation_error() -> None:
         TerraformOutputs.model_validate({"instance_id": "i-1"})
 
 
-def test_gcp_terraform_variables(tmp_path: Path) -> None:
-    path = (
-        Path(__file__).resolve().parent.parent
-        / "edge_installer"
-        / "config"
-        / "examples"
-        / "installation.gcp.yaml"
-    )
-    config = load_configuration(path)
-    runner = GcpTerraformRunner(config, tmp_path)
-    variables = runner.variables()
 
-    assert variables["project_id"] == "your-gcp-project"
-    assert variables["region"] == "europe-west1"
-    assert variables["backend_image"] == config.deployment.backend_image
-    assert "postgres_password" not in variables
-    assert "jwt_secret" not in variables
-    assert variables["labels"]["managed-by"] == "edge-installer"
+def test_terraform_variables_open_mqtt_only_for_bundled_broker(tmp_path: Path) -> None:
+    config = load_configuration(EXAMPLE)
+    assert TerraformRunner(config, tmp_path).variables()["mqtt_listen_port"] == 8883
 
+    config.services.mqtt.broker = "external"
+    config.services.mqtt.broker_host = "mqtt.example.net"
+    assert TerraformRunner(config, tmp_path).variables()["mqtt_listen_port"] == 0
+
+    config.services.mqtt.enabled = False
+    assert TerraformRunner(config, tmp_path).variables()["mqtt_listen_port"] == 0
+
+
+def test_terraform_binary_prefers_env_then_terraform_then_tofu(monkeypatch) -> None:
+    from edge_installer.providers.aws import terraform as tf
+
+    found: set[str] = set()
+    monkeypatch.setattr(tf.shutil, "which", lambda name: f"/usr/bin/{name}" if name in found else None)
+    monkeypatch.delenv(tf.TERRAFORM_ENV, raising=False)
+
+    assert tf.terraform_binary() == "terraform"  # nothing installed: the error names terraform
+    found.add("tofu")
+    assert tf.terraform_binary() == "tofu"
+    found.add("terraform")
+    assert tf.terraform_binary() == "terraform"
+    monkeypatch.setenv(tf.TERRAFORM_ENV, "/opt/tofu/bin/tofu")
+    assert tf.terraform_binary() == "/opt/tofu/bin/tofu"

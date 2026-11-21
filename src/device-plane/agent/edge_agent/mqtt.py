@@ -17,14 +17,29 @@ import paho.mqtt.client as mqtt
 
 from edge_agent.metrics import collect_metrics, read_uptime_seconds
 from edge_agent.mqtt_config import MqttConfig, resolve_mqtt_broker_host
+from edge_agent.observer import DeviceObserver
 
 logger = logging.getLogger("edge_agent")
 
-AGENT_VERSION = "0.2.0"
+
+def _installed_version() -> str:
+    """The meteorcli version, the same value heartbeats send as agent_version."""
+    try:
+        from meteorcli import __version__
+    except ImportError:
+        return "0.0.0"
+    return str(__version__)
+
+
+AGENT_VERSION = _installed_version()
 COMMANDS_QOS = 1
 STATUS_QOS = 1
 METRICS_INTERVAL_SECONDS = 60.0
-DEVICE_PUBLISH_SUFFIXES = frozenset({"status", "metrics", "commands/result"})
+# Re-publish online after connect so a stale last-will "offline" from the previous
+# MQTT session does not win the race and leave cloud availability stuck offline.
+ONLINE_RECONFIRM_SECONDS = 2.0
+DEVICE_PUBLISH_SUFFIXES = frozenset({"status", "metrics", "events", "commands/result"})
+EVENTS_QOS = 1
 DEVICE_SUBSCRIBE_SUFFIXES = frozenset({"commands"})
 
 
@@ -110,8 +125,10 @@ class DeviceMqttSession:
         tls_insecure: bool | None = None,
         server_url: str | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        observer: DeviceObserver | None = None,
     ) -> None:
         self.device_id = device_id
+        self.observer = observer or DeviceObserver()
         self.config = config
         self.tls_insecure = tls_insecure_enabled() if tls_insecure is None else tls_insecure
         self.server_url = server_url
@@ -119,6 +136,8 @@ class DeviceMqttSession:
         self._client: mqtt.Client | None = None
         self._metrics_stop = Event()
         self._metrics_thread: Thread | None = None
+        self._online_reconfirm_stop = Event()
+        self._online_reconfirm_thread: Thread | None = None
 
     def _broker_host(self) -> str:
         return resolve_mqtt_broker_host(self.config.host, self.server_url)
@@ -134,6 +153,10 @@ class DeviceMqttSession:
     @property
     def metrics_topic(self) -> str:
         return f"devices/{self.device_id}/metrics"
+
+    @property
+    def events_topic(self) -> str:
+        return f"devices/{self.device_id}/events"
 
     @property
     def result_topic(self) -> str:
@@ -168,6 +191,7 @@ class DeviceMqttSession:
         client.connect_async(self._broker_host(), self.config.port, 60)
         client.loop_start()
         self._client = client
+        self.observer.install()
         self._metrics_stop.clear()
         self._metrics_thread = Thread(target=self._metrics_loop, name="mqtt-metrics", daemon=True)
         self._metrics_thread.start()
@@ -175,6 +199,9 @@ class DeviceMqttSession:
     def stop(self) -> None:
         client = self._client
         self._metrics_stop.set()
+        self._online_reconfirm_stop.set()
+        if self._online_reconfirm_thread and self._online_reconfirm_thread.is_alive():
+            self._online_reconfirm_thread.join(timeout=ONLINE_RECONFIRM_SECONDS + 0.5)
         if client is None:
             return
         try:
@@ -214,13 +241,40 @@ class DeviceMqttSession:
             logger.warning("MQTT connect failed")
             return
         client.subscribe(self.commands_topic, qos=COMMANDS_QOS)
+        self._publish_online(client)
+        self._schedule_online_reconfirm()
+        logger.info("MQTT connected; subscribed to commands")
+
+    def _publish_online(self, client: mqtt.Client) -> None:
         client.publish(
             self.status_topic,
             payload=json.dumps(online_status_payload()),
             qos=STATUS_QOS,
             retain=True,
         )
-        logger.info("MQTT connected; subscribed to commands")
+
+    def _schedule_online_reconfirm(self) -> None:
+        self._online_reconfirm_stop.set()
+        if self._online_reconfirm_thread and self._online_reconfirm_thread.is_alive():
+            self._online_reconfirm_thread.join(timeout=0.1)
+        self._online_reconfirm_stop = Event()
+        stop = self._online_reconfirm_stop
+
+        def _reconfirm() -> None:
+            if stop.wait(ONLINE_RECONFIRM_SECONDS):
+                return
+            client = self._client
+            if client is None or stop.is_set():
+                return
+            try:
+                self._publish_online(client)
+            except Exception:
+                logger.debug("Could not reconfirm MQTT online status")
+
+        self._online_reconfirm_thread = Thread(
+            target=_reconfirm, name="mqtt-online-reconfirm", daemon=True
+        )
+        self._online_reconfirm_thread.start()
 
     def _on_disconnect(
         self,
@@ -261,8 +315,11 @@ class DeviceMqttSession:
         client = self._client
         if client is None:
             return
+        events: list[dict] = []
         try:
             body = collect_metrics()
+            extra, events = self.observer.observe()
+            body.update(extra)
             body["timestamp"] = utc_timestamp()
             client.publish(
                 self.metrics_topic,
@@ -272,6 +329,20 @@ class DeviceMqttSession:
             )
         except Exception:
             logger.debug("Could not publish MQTT metrics")
+        for event in events:
+            self._publish_event(client, event)
+
+    def _publish_event(self, client: mqtt.Client, event: dict) -> None:
+        """App lifecycle changes and system warnings, kept as device events in the cloud."""
+        try:
+            client.publish(
+                self.events_topic,
+                payload=json.dumps({"timestamp": utc_timestamp(), **event}),
+                qos=EVENTS_QOS,
+                retain=False,
+            )
+        except Exception:
+            logger.debug("Could not publish MQTT event")
 
 
 def commands_topic(device_id: str) -> str:
@@ -373,8 +444,7 @@ def _wait_for_connect(
     reason_code = connect_result.get("reason_code")
     if getattr(reason_code, "is_failure", False):
         raise RuntimeError(
-            f"MQTT connect refused: {reason_code}. "
-            "If this device was re-registered, mqtt.json has a stale password."
+            f"MQTT connect refused: {reason_code}. If this device was re-registered, mqtt.json has a stale password."
         )
     if "disconnect" in connect_result and reason_code is None:
         raise RuntimeError(

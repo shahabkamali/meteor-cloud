@@ -5,6 +5,7 @@ import {
   approveEnrollmentRequest,
   listDeviceGroups,
   listDeviceTypes,
+  listDevices,
   listEnrollmentRequests,
   rejectEnrollmentRequest,
   type DeviceEnrollmentRequest,
@@ -13,11 +14,31 @@ import { ApiError } from "@/api/http";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { typedDefaultName } from "@/lib/deviceNames";
+import { useDebounced } from "@/lib/useDebounced";
 import { formatDateTime } from "@/lib/utils";
 
 function isActiveEnrollmentRequest(entry: DeviceEnrollmentRequest): boolean {
   return entry.status === "pending" || (entry.status === "approved" && entry.claimed_at == null);
 }
+
+function displayName(entry: DeviceEnrollmentRequest): string {
+  return entry.assigned_name ?? entry.suggested_name ?? entry.requested_name ?? "—";
+}
+
+function primaryMac(addresses: string[]): string | null {
+  return addresses[0] ?? null;
+}
+
+function enrollmentKeyLabel(entry: DeviceEnrollmentRequest): string {
+  return entry.enrollment_key_name || entry.enrollment_key_prefix || "Revoked/deleted key";
+}
+
+function sameName(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
+}
+
+const NAME_CHECK_DELAY_MS = 400;
 
 type PendingEnrollmentRequestsProps = {
   organizationId: string;
@@ -37,7 +58,9 @@ export function PendingEnrollmentRequests({
   const queryClient = useQueryClient();
   const [approveId, setApproveId] = useState<string | null>(null);
   const [approveName, setApproveName] = useState("");
+  const [approveDefaultName, setApproveDefaultName] = useState("");
   const [approveTypeId, setApproveTypeId] = useState("");
+  const [approveSuggestedName, setApproveSuggestedName] = useState("");
   const [approveGroupId, setApproveGroupId] = useState("");
 
   const requestsQuery = useQuery({
@@ -61,6 +84,36 @@ export function PendingEnrollmentRequests({
     [requestsQuery.data],
   );
 
+  // Repeated names are allowed, so this only warns. A device keeps its suggested name without a check.
+  const typedName = useDebounced(approveName.trim(), NAME_CHECK_DELAY_MS);
+  const checkName = Boolean(approveId && typedName && typedName !== approveDefaultName);
+  const namesakesQuery = useQuery({
+    queryKey: ["devices", organizationId, "name", typedName, token],
+    queryFn: () =>
+      listDevices(token, organizationId, { name: typedName, page_size: 1 }),
+    enabled: checkName,
+  });
+  const nameInUse =
+    checkName &&
+    ((namesakesQuery.data?.total ?? 0) > 0 ||
+      activeRequests.some(
+        (entry) => entry.id !== approveId && sameName(displayName(entry), typedName),
+      ));
+
+  /** A generated name follows the chosen type until someone types their own. */
+  function onApproveTypeChange(typeId: string) {
+    setApproveTypeId(typeId);
+    const entry = activeRequests.find((item) => item.id === approveId);
+    if (!entry?.name_suffix || approveName !== approveDefaultName) {
+      return;
+    }
+    const type = (typesQuery.data ?? []).find((item) => item.id === typeId);
+    const name =
+      (type && typedDefaultName(type.slug, entry.name_suffix)) || approveSuggestedName;
+    setApproveName(name);
+    setApproveDefaultName(name);
+  }
+
   if (hideWhenEmpty && activeRequests.length === 0) {
     return null;
   }
@@ -72,12 +125,13 @@ export function PendingEnrollmentRequests({
     }
     try {
       await approveEnrollmentRequest(token, organizationId, approveId, {
-        name: approveName || undefined,
+        name: approveName.trim() || undefined,
         device_type_id: approveTypeId || undefined,
         device_group_id: approveGroupId || undefined,
       });
       setApproveId(null);
       setApproveName("");
+      setApproveDefaultName("");
       setApproveTypeId("");
       setApproveGroupId("");
       await Promise.all([
@@ -106,54 +160,64 @@ export function PendingEnrollmentRequests({
   return (
     <div className="space-y-3">
       <h2 className="text-lg font-semibold">Pending enrollment requests</h2>
-      <div className="overflow-hidden rounded-lg border border-border bg-white/80 shadow-sm">
+      <div className="overflow-x-auto rounded-lg border border-border bg-card shadow-glow">
         <table className="min-w-full text-left text-sm">
-          <thead className="border-b border-border bg-secondary/60 text-xs uppercase tracking-wide text-muted-foreground">
+          <thead className="border-b border-border bg-background text-xs uppercase tracking-wide text-muted-foreground">
             <tr>
               <th className="px-4 py-3 font-semibold">Name</th>
               <th className="px-4 py-3 font-semibold">Hostname</th>
               <th className="px-4 py-3 font-semibold">MAC address</th>
+              <th className="px-4 py-3 font-semibold">Enrollment key</th>
               <th className="px-4 py-3 font-semibold">Architecture</th>
               <th className="px-4 py-3 font-semibold">Requested</th>
-              <th className="px-4 py-3 font-semibold">Status</th>
-              {canManage && <th className="px-4 py-3 font-semibold">Actions</th>}
+              <th className="px-4 py-3 font-semibold whitespace-nowrap">Status</th>
+              {canManage && <th className="px-4 py-3 font-semibold whitespace-nowrap">Actions</th>}
             </tr>
           </thead>
           <tbody>
             {activeRequests.map((entry) => (
-              <tr key={entry.id} className="border-b border-border/70">
+              <tr key={entry.id} className="border-b border-border">
                 <td className="px-4 py-3 font-medium">
-                  {entry.assigned_name ?? entry.requested_name ?? "—"}
+                  {displayName(entry)}
                 </td>
-                <td className="px-4 py-3 text-muted-foreground">{entry.hostname ?? "—"}</td>
-                <td className="px-4 py-3 font-mono text-xs">
-                  {entry.mac_addresses.length ? entry.mac_addresses.join(", ") : "—"}
+                <td className="px-4 py-3 text-muted-foreground">
+                  {entry.hostname ?? "—"}
+                  {entry.hardware_model && (
+                    <span className="block text-xs">{entry.hardware_model}</span>
+                  )}
                 </td>
+                <td className="px-4 py-3 font-mono text-xs">{primaryMac(entry.mac_addresses) ?? "—"}</td>
+                <td className="px-4 py-3 text-muted-foreground">{enrollmentKeyLabel(entry)}</td>
                 <td className="px-4 py-3 text-muted-foreground">{entry.architecture ?? "—"}</td>
                 <td className="px-4 py-3 text-muted-foreground">
                   {formatDateTime(entry.created_at)}
                 </td>
-                <td className="px-4 py-3">
+                <td className="px-4 py-3 whitespace-nowrap">
                   {entry.status === "approved" ? (
-                    <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800">
+                    <span className="inline-flex whitespace-nowrap rounded-full bg-ember px-2 py-0.5 text-xs font-medium text-midnight">
                       Awaiting device
                     </span>
                   ) : (
-                    <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
+                    <span className="inline-flex whitespace-nowrap rounded-full bg-sky-blue px-2 py-0.5 text-xs font-medium text-midnight">
                       Pending approval
                     </span>
                   )}
                 </td>
                 {canManage && (
-                  <td className="px-4 py-3">
+                  <td className="px-4 py-3 whitespace-nowrap">
                     {entry.status === "pending" ? (
                       <div className="flex gap-2">
                         <Button
                           size="sm"
                           onClick={() => {
                             setApproveId(entry.id);
-                            setApproveName(entry.requested_name ?? "");
-                            setApproveTypeId(entry.device_type_id ?? "");
+                            const name = entry.suggested_name ?? entry.requested_name ?? "";
+                            setApproveName(name);
+                            setApproveDefaultName(name);
+                            setApproveSuggestedName(name);
+                            setApproveTypeId(
+                              entry.device_type_id ?? entry.suggested_device_type_id ?? "",
+                            );
                             setApproveGroupId(entry.device_group_id ?? "");
                           }}
                         >
@@ -164,7 +228,9 @@ export function PendingEnrollmentRequests({
                         </Button>
                       </div>
                     ) : (
-                      <span className="text-xs text-muted-foreground">Waiting for claim</span>
+                      <span className="whitespace-nowrap text-xs text-muted-foreground">
+                        Waiting for claim
+                      </span>
                     )}
                   </td>
                 )}
@@ -174,7 +240,7 @@ export function PendingEnrollmentRequests({
               <tr>
                 <td
                   className="px-4 py-6 text-center text-muted-foreground"
-                  colSpan={canManage ? 7 : 6}
+                  colSpan={canManage ? 8 : 7}
                 >
                   No pending enrollment requests.
                 </td>
@@ -186,20 +252,19 @@ export function PendingEnrollmentRequests({
 
       {canManage && approveId && (
         <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-overlay p-4"
           role="dialog"
           aria-modal="true"
           aria-label="Approve device"
         >
           <form
-            className="grid w-full max-w-lg gap-3 rounded-lg border border-border bg-white p-6 shadow-lg"
+            className="grid w-full max-w-lg gap-3 rounded-lg border border-border bg-card p-6 shadow-glow"
             onSubmit={onApprove}
           >
             <div>
               <h2 className="text-lg font-semibold">Approve device</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                Optionally set the name, type, and group assigned when the device claims its
-                credential.
+                The device gets this name, type, and group when it claims its credential.
               </p>
             </div>
             <div>
@@ -209,14 +274,25 @@ export function PendingEnrollmentRequests({
                 value={approveName}
                 onChange={(event) => setApproveName(event.target.value)}
               />
+              <p className="mt-1 text-xs text-muted-foreground">
+                {approveName === approveDefaultName &&
+                activeRequests.find((item) => item.id === approveId)?.name_suffix
+                  ? "Device type and the end of its MAC address. It follows the device type below; you can rename it later."
+                  : "You can rename it later."}
+              </p>
+              {nameInUse && (
+                <p className="mt-1 text-xs text-destructive">
+                  Another device already has this name. You can still use it.
+                </p>
+              )}
             </div>
             <div>
               <Label htmlFor="approve-type">Device type</Label>
               <select
                 id="approve-type"
-                className="flex h-10 w-full rounded-md border border-input bg-white px-3 text-sm"
+                className="flex h-10 w-full rounded-md border border-input bg-field text-foreground px-3 text-sm"
                 value={approveTypeId}
-                onChange={(event) => setApproveTypeId(event.target.value)}
+                onChange={(event) => onApproveTypeChange(event.target.value)}
               >
                 <option value="">None</option>
                 {(typesQuery.data ?? []).map((type) => (
@@ -230,7 +306,7 @@ export function PendingEnrollmentRequests({
               <Label htmlFor="approve-group">Device group</Label>
               <select
                 id="approve-group"
-                className="flex h-10 w-full rounded-md border border-input bg-white px-3 text-sm"
+                className="flex h-10 w-full rounded-md border border-input bg-field text-foreground px-3 text-sm"
                 value={approveGroupId}
                 onChange={(event) => setApproveGroupId(event.target.value)}
               >

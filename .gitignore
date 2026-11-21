@@ -30,6 +30,8 @@ dist/
 .env
 .env.local
 .env.*.local
+.env.smoke
+.meteorenv
 
 # IDE
 .idea/
@@ -80,3 +82,20 @@ override.tf.json
 # Local MQTT TLS material (private keys must never be committed)
 certs/*
 !certs/.gitkeep
+
+# Ansible inventories with real hosts (keep the example)
+deploy/ansible/inventory/*
+!deploy/ansible/inventory/example*/
+deploy/ansible/.ansible/
+
+# Local k3d MQTT certificates
+.k8s/
+
+# Ansible WireGuard gateway hand-off files (contain public keys and endpoints)
+deploy/ansible/artifacts/
+
+# MeteorCloud E2E environments (state, keys, generated secrets, reports)
+tests/e2e/.env
+tests/e2e/.state/
+tests/e2e/terraform/*/.terraform-validate/
+deploy/compose/backups/

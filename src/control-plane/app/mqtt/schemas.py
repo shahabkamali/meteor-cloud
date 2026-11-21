@@ -18,13 +18,25 @@ class MqttConnectInfo(BaseModel):
     ca_cert: str | None = None
 
 
+class AgentMqttStatusResponse(BaseModel):
+    enabled: bool
+    config_version: str | None = None
+
+
+class AgentMqttCredentialsResponse(MqttConnectInfo):
+    config_version: str
+
+
 class MqttAuthRequest(BaseModel):
     username: str = ""
     password: str = ""
+    # Sent by the bundled brokers so a device cannot reuse another device's client id.
+    clientid: str | None = None
 
 
 class MqttAuthResponse(BaseModel):
-    result: Literal["allow", "deny"]
+    # "ignore" hands the decision to the broker's next authenticator (the data plane).
+    result: Literal["allow", "deny", "ignore"]
     is_superuser: bool = False
 
 
@@ -32,10 +44,13 @@ class MqttAuthorizeRequest(BaseModel):
     username: str = ""
     topic: str = ""
     action: str = ""
+    clientid: str | None = None
+    # EMQX sends "true"/"false" strings for ${retain}; Mosquitto sends a bool.
+    retain: bool | str | None = None
 
 
 class MqttAuthorizeResponse(BaseModel):
-    result: Literal["allow", "deny"]
+    result: Literal["allow", "deny", "ignore"]
 
 
 class DevicePingResponse(BaseModel):

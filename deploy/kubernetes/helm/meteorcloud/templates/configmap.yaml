@@ -1,0 +1,78 @@
+{{- include "meteorcloud.validate" . }}
+{{- $fullname := include "meteorcloud.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "meteorcloud.labels" . | nindent 4 }}
+data:
+  APP_NAME: edge-platform
+  APP_ENV: {{ .Values.config.appEnv | quote }}
+  APP_DEBUG: "false"
+  PLATFORM_VERSION: {{ .Chart.AppVersion | quote }}
+  BACKEND_HOST: "0.0.0.0"
+  BACKEND_PORT: "8000"
+  BACKEND_CORS_ORIGINS: {{ .Values.config.publicUrl | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  LOG_FORMAT: {{ .Values.config.logFormat | quote }}
+  METRICS_ENABLED: {{ .Values.metrics.enabled | toString | quote }}
+  REGISTRATION_REQUIRE_HTTPS: {{ .Values.config.registrationRequireHttps | toString | quote }}
+  ALLOW_SIGNUP: {{ .Values.config.allowSignup | toString | quote }}
+  FORWARDED_ALLOW_IPS: {{ .Values.config.forwardedAllowIps | quote }}
+  DATABASE_PROVIDER: postgresql
+  TELEMETRY_PROVIDER: postgresql
+  DEPLOYMENT_PROVIDER: native
+  OTA_PROVIDER: none
+  IDENTITY_PROVIDER: local
+  CONNECTIVITY_PROVIDER: {{ .Values.connectivity.provider | quote }}
+  {{- if eq .Values.connectivity.provider "wireguard" }}
+  {{- with .Values.connectivity.wireguard }}
+  WIREGUARD_SERVER_PUBLIC_KEY: {{ .serverPublicKey | quote }}
+  WIREGUARD_SERVER_ENDPOINT: {{ .serverEndpoint | quote }}
+  WIREGUARD_SERVER_ADDRESS: {{ .serverAddress | quote }}
+  WIREGUARD_CLIENT_CIDR: {{ .clientCidr | quote }}
+  {{- end }}
+  {{- end }}
+  {{- with .Values.connectivity.shell }}
+  SHELL_PROVIDER: {{ .provider | quote }}
+  SHELL_SSH_USER: {{ .sshUser | quote }}
+  {{- if eq .provider "ssh_gateway" }}
+  SHELL_SSH_IDENTITY_FILE: /run/meteorcloud/shell/id_ed25519
+  {{- if .certificates }}
+  SHELL_SSH_CA_FILE: /run/meteorcloud/shell/ca
+  {{- end }}
+  SHELL_GATEWAY_KEY_RETIRED: {{ .gatewayKeyRetired | quote }}
+  {{- end }}
+  {{- end }}
+  APPS_BASE_DOMAIN: {{ .Values.connectivity.apps.baseDomain | quote }}
+  APPS_RESERVED_NAMES: {{ .Values.connectivity.apps.reservedNames | quote }}
+  APPS_ALLOW_SHORT_NAMES: {{ .Values.connectivity.apps.allowShortNames | quote }}
+  CACHE_PROVIDER: {{ .Values.cache.provider | quote }}
+  OBJECT_STORAGE_PROVIDER: {{ .Values.objectStorage.provider | quote }}
+  OBJECT_STORAGE_PATH: /data/artifacts
+  {{- with .Values.objectStorage.s3 }}
+  OBJECT_STORAGE_ENDPOINT_URL: {{ .endpointUrl | quote }}
+  OBJECT_STORAGE_PUBLIC_ENDPOINT_URL: {{ .publicEndpointUrl | default "" | quote }}
+  OBJECT_STORAGE_REGION: {{ .region | quote }}
+  OBJECT_STORAGE_BUCKET: {{ .bucket | quote }}
+  OBJECT_STORAGE_AUTO_CREATE_BUCKET: {{ .autoCreateBucket | toString | quote }}
+  {{- end }}
+  MQTT_ENABLED: {{ .Values.mqtt.enabled | toString | quote }}
+  MQTT_PROVIDER: {{ .Values.mqtt.provider | quote }}
+  MQTT_BROKER_HOST: {{ include "meteorcloud.mqttBrokerHost" . | quote }}
+  MQTT_BROKER_PORT: {{ .Values.mqtt.port | toString | quote }}
+  MQTT_PUBLIC_HOST: {{ .Values.mqtt.publicHost | quote }}
+  MQTT_PLATFORM_USERNAME: {{ .Values.mqtt.platformUsername | quote }}
+  MQTT_CA_CERT_PATH: /certs/ca.crt
+  DATA_PLANE_URL: {{ printf "http://%s-data-plane:8081" $fullname | quote }}
+  {{- if .Values.dataApi.enabled }}
+  DATA_PLANE_API_URL: {{ printf "http://%s-data-api:8092" $fullname | quote }}
+  DATA_PLANE_PUBLIC_URL: {{ .Values.config.publicUrl | quote }}
+  {{- end }}
+  {{- range $key, $value := .Values.config.extraEnv }}
+  {{- if eq $key "METRICS_ENABLED" }}
+  {{- fail "config.extraEnv.METRICS_ENABLED: set metrics.enabled instead" }}
+  {{- end }}
+  {{ $key }}: {{ $value | toString | quote }}
+  {{- end }}

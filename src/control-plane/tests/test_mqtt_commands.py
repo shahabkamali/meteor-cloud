@@ -54,16 +54,21 @@ def _client_with_publisher(db_session: Session, publisher) -> TestClient:
     application.dependency_overrides[get_db] = override_get_db
     application.dependency_overrides[get_mqtt_publisher] = lambda: publisher
     from app.devices.dependencies import (
+        get_enroll_poll_ip_rate_limiter,
         get_enroll_poll_rate_limiter,
         get_enroll_request_rate_limiter,
         get_rate_limiter,
     )
     from app.devices.rate_limit import InMemoryRateLimiter
+    from app.identity.dependencies import get_login_email_rate_limiter, get_login_ip_rate_limiter
 
     limiter = InMemoryRateLimiter(limit=10_000, window_seconds=60)
+    application.dependency_overrides[get_login_email_rate_limiter] = lambda: limiter
+    application.dependency_overrides[get_login_ip_rate_limiter] = lambda: limiter
     application.dependency_overrides[get_rate_limiter] = lambda: limiter
     application.dependency_overrides[get_enroll_request_rate_limiter] = lambda: limiter
     application.dependency_overrides[get_enroll_poll_rate_limiter] = lambda: limiter
+    application.dependency_overrides[get_enroll_poll_ip_rate_limiter] = lambda: limiter
     return TestClient(application)
 
 

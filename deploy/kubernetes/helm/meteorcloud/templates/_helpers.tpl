@@ -1,0 +1,185 @@
+{{- define "meteorcloud.name" -}}
+{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "meteorcloud.fullname" -}}
+{{- if .Values.fullnameOverride }}
+{{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- $name := default .Chart.Name .Values.nameOverride }}
+{{- if contains $name .Release.Name }}
+{{- .Release.Name | trunc 63 | trimSuffix "-" }}
+{{- else }}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{- define "meteorcloud.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
+app.kubernetes.io/name: {{ include "meteorcloud.name" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/* Usage: include "meteorcloud.selectorLabels" (dict "ctx" $ "component" "backend") */}}
+{{- define "meteorcloud.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "meteorcloud.name" .ctx }}
+app.kubernetes.io/instance: {{ .ctx.Release.Name }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{- define "meteorcloud.componentLabels" -}}
+{{ include "meteorcloud.labels" .ctx }}
+app.kubernetes.io/component: {{ .component }}
+{{- end }}
+
+{{/* Usage: include "meteorcloud.image" (dict "ctx" $ "image" .Values.backend.image) */}}
+{{- define "meteorcloud.image" -}}
+{{- printf "%s:%s" .image.repository (.image.tag | default .ctx.Chart.AppVersion | toString) }}
+{{- end }}
+
+{{- define "meteorcloud.secretName" -}}
+{{- .Values.secrets.existingSecret | default (include "meteorcloud.fullname" .) }}
+{{- end }}
+
+{{- define "meteorcloud.mqttBrokerHost" -}}
+{{- if and (eq .Values.mqtt.broker "bundled") (eq .Values.mqtt.provider "emqx") }}
+{{- printf "%s-emqx" (include "meteorcloud.fullname" .) }}
+{{- else if eq .Values.mqtt.broker "bundled" }}
+{{- printf "%s-mqtt" (include "meteorcloud.fullname" .) }}
+{{- else }}
+{{- .Values.mqtt.external.host }}
+{{- end }}
+{{- end }}
+
+{{- define "meteorcloud.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- .Values.serviceAccount.name | default (include "meteorcloud.fullname" .) }}
+{{- else }}
+{{- .Values.serviceAccount.name | default "default" }}
+{{- end }}
+{{- end }}
+
+{{- define "meteorcloud.artifactsClaimName" -}}
+{{- .Values.objectStorage.filesystem.existingClaim | default (printf "%s-artifacts" (include "meteorcloud.fullname" .)) }}
+{{- end }}
+
+{{- define "meteorcloud.filesystemRWO" -}}
+{{- if and (eq .Values.objectStorage.provider "filesystem") (not (has "ReadWriteMany" .Values.objectStorage.filesystem.accessModes)) }}true{{ end }}
+{{- end }}
+
+{{/* Fails rendering on unsupported combinations; included from the ConfigMap. */}}
+{{- define "meteorcloud.validate" -}}
+{{- $v := .Values }}
+{{- if not (has $v.postgresql.mode (list "bundled" "external")) }}
+{{- fail "postgresql.mode must be bundled or external" }}
+{{- end }}
+{{- if and (eq $v.postgresql.mode "external") (not $v.secrets.existingSecret) (not $v.postgresql.external.url) (not $v.postgresql.external.host) }}
+{{- fail "postgresql.mode=external needs postgresql.external.url, postgresql.external.host, or secrets.existingSecret with DATABASE_URL" }}
+{{- end }}
+{{- if not (has $v.connectivity.provider (list "none" "wireguard")) }}
+{{- fail "connectivity.provider must be none or wireguard" }}
+{{- end }}
+{{- if and (eq $v.connectivity.provider "wireguard") (or (not $v.connectivity.wireguard.serverPublicKey) (not $v.connectivity.wireguard.serverEndpoint)) }}
+{{- fail "connectivity.provider=wireguard needs connectivity.wireguard.serverPublicKey and serverEndpoint (from deploy/ansible/playbooks/wireguard.yml)" }}
+{{- end }}
+{{- if not (has $v.connectivity.shell.provider (list "none" "ssh_gateway")) }}
+{{- fail "connectivity.shell.provider must be none or ssh_gateway" }}
+{{- end }}
+{{- if and (eq $v.connectivity.shell.provider "ssh_gateway") (or (ne $v.connectivity.provider "wireguard") (not $v.connectivity.shell.existingSecret)) }}
+{{- fail "connectivity.shell.provider=ssh_gateway needs connectivity.provider=wireguard and connectivity.shell.existingSecret (id_ed25519, id_ed25519.pub)" }}
+{{- end }}
+{{- if and $v.connectivity.apps.proxy.enabled (or (ne $v.connectivity.provider "wireguard") (not $v.connectivity.apps.baseDomain) (not $v.connectivity.apps.proxy.acme.email)) }}
+{{- fail "connectivity.apps.proxy.enabled needs connectivity.provider=wireguard, connectivity.apps.baseDomain and connectivity.apps.proxy.acme.email" }}
+{{- end }}
+{{- if and (or $v.metrics.serviceMonitor.enabled $v.metrics.prometheusRule.enabled) (not ($.Capabilities.APIVersions.Has "monitoring.coreos.com/v1")) }}
+{{- fail "metrics.serviceMonitor/prometheusRule need the Prometheus Operator CRDs (monitoring.coreos.com/v1). Install them, or pass --api-versions monitoring.coreos.com/v1 to helm template" }}
+{{- end }}
+{{- if and $v.metrics.serviceMonitor.enabled (not $v.metrics.enabled) }}
+{{- fail "metrics.serviceMonitor.enabled needs metrics.enabled=true" }}
+{{- end }}
+{{- if not (has $v.cache.provider (list "memory" "redis")) }}
+{{- fail "cache.provider must be memory or redis" }}
+{{- end }}
+{{- if and (eq $v.cache.provider "redis") (eq $v.cache.redis.mode "external") (not $v.secrets.existingSecret) (not $v.cache.redis.external.url) }}
+{{- fail "cache.redis.mode=external needs cache.redis.external.url or secrets.existingSecret with REDIS_URL" }}
+{{- end }}
+{{- $redisUrl := $v.cache.redis.external.url | default "" }}
+{{- if and (eq $v.cache.provider "redis") (eq $v.cache.redis.mode "external") $redisUrl (hasPrefix "redis://" $redisUrl) (contains "@" $redisUrl) }}
+{{- fail "cache.redis.external.url with credentials must use rediss:// (TLS)" }}
+{{- end }}
+{{- if not (has $v.objectStorage.provider (list "filesystem" "s3")) }}
+{{- fail "objectStorage.provider must be filesystem or s3" }}
+{{- end }}
+{{- if and (eq $v.objectStorage.provider "s3") (not $v.objectStorage.s3.bucket) }}
+{{- fail "objectStorage.provider=s3 needs objectStorage.s3.bucket" }}
+{{- end }}
+{{- if and (include "meteorcloud.filesystemRWO" .) (gt (int $v.backend.replicaCount) 1) }}
+{{- fail "backend.replicaCount > 1 needs objectStorage.provider=s3 or a ReadWriteMany filesystem volume" }}
+{{- end }}
+{{- if $v.mqtt.enabled }}
+{{- if not (has $v.mqtt.broker (list "bundled" "external")) }}
+{{- fail "mqtt.broker must be bundled or external" }}
+{{- end }}
+{{- if not (has $v.mqtt.provider (list "mosquitto" "emqx" "vernemq")) }}
+{{- fail "mqtt.provider must be mosquitto, emqx, or vernemq" }}
+{{- end }}
+{{- if and (eq $v.mqtt.broker "bundled") (eq $v.mqtt.provider "vernemq") }}
+{{- fail "mqtt.provider=vernemq is not bundled by this chart: deploy VerneMQ yourself (see docs/fleet/mqtt.md) and set mqtt.broker=external with mqtt.external.host" }}
+{{- end }}
+{{- if not $v.mqtt.tls.existingSecret }}
+{{- fail "mqtt.enabled needs mqtt.tls.existingSecret (ca.crt; plus server.crt and server.key for the bundled broker)" }}
+{{- end }}
+{{- if and (eq $v.mqtt.broker "external") (not $v.mqtt.external.host) }}
+{{- fail "mqtt.broker=external needs mqtt.external.host" }}
+{{- end }}
+{{- if not $v.mqtt.publicHost }}
+{{- fail "mqtt.enabled needs mqtt.publicHost (the hostname devices connect to)" }}
+{{- end }}
+{{- end }}
+{{- if $v.dataApi.enabled }}
+{{- if not (has $v.dataApi.bus (list "memory" "mqtt")) }}
+{{- fail "dataApi.bus must be memory or mqtt" }}
+{{- end }}
+{{- if not (has $v.dataApi.storage (list "postgres" "memory")) }}
+{{- fail "dataApi.storage must be postgres or memory" }}
+{{- end }}
+{{- if and (eq $v.dataApi.bus "mqtt") (not $v.mqtt.enabled) }}
+{{- fail "dataApi.bus=mqtt needs mqtt.enabled=true" }}
+{{- end }}
+{{- if and (eq $v.dataApi.bus "memory") (gt (int $v.dataApi.replicaCount) 1) }}
+{{- fail "dataApi.bus=memory needs dataApi.replicaCount=1 (in-process bus)" }}
+{{- end }}
+{{- if and (eq $v.dataApi.storage "memory") (gt (int $v.dataApi.replicaCount) 1) }}
+{{- fail "dataApi.storage=memory needs dataApi.replicaCount=1 (in-process store)" }}
+{{- end }}
+{{- if and $v.dataApi.mqtt.jwtSecret (not $v.dataApi.mqtt.direct) }}
+{{- fail "dataApi.mqtt.jwtSecret is only used with dataApi.mqtt.direct=true" }}
+{{- end }}
+{{- if $v.dataApi.mqtt.direct }}
+{{- if or (ne $v.dataApi.bus "mqtt") (ne $v.mqtt.provider "emqx") }}
+{{- fail "dataApi.mqtt.direct needs dataApi.bus=mqtt and mqtt.provider=emqx (Mosquitto and VerneMQ refuse application logins)" }}
+{{- end }}
+{{- if and $v.dataApi.mqtt.jwtSecret (lt (len $v.dataApi.mqtt.jwtSecret) 32) }}
+{{- fail "dataApi.mqtt.jwtSecret must be at least 32 characters" }}
+{{- end }}
+{{- end }}
+{{- /* Fail closed with an existing Secret: the data API and the API share this token.
+     lookup is empty under helm template, so this only runs against a cluster. */}}
+{{- if $v.secrets.existingSecret }}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace $v.secrets.existingSecret }}
+{{- if $existing }}
+{{- $keys := list "DATA_PLANE_INTERNAL_TOKEN" }}
+{{- if eq $v.dataApi.storage "postgres" }}{{ $keys = append $keys "DATAPLANE_DATABASE_URL" }}{{ end }}
+{{- if $v.dataApi.mqtt.direct }}{{ $keys = append $keys "DATAPLANE_MQTT_JWT_SECRET" }}{{ end }}
+{{- range $key := $keys }}
+{{- if not (get ($existing.data | default dict) $key) }}
+{{- fail (printf "dataApi.enabled: Secret %s has no %s" $v.secrets.existingSecret $key) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

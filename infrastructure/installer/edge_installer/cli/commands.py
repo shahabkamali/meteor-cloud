@@ -8,12 +8,9 @@ from pathlib import Path
 from rich.console import Console
 
 from edge_installer.config.loader import load_configuration
-from edge_installer.config.validation import (
-    validate_aws_credentials,
-    validate_configuration,
-    validate_dependencies,
-    validate_gcp_credentials,
-)
+from edge_installer.config.validation import ensure_valid
+from edge_installer.deployment.dns import dns_records
+from edge_installer.deployment.prepare import prepare_apply
 from edge_installer.deployment.service import PlatformDeploymentService
 from edge_installer.exceptions import ConfigurationError, InstallerError
 
@@ -38,18 +35,8 @@ def run_init(*, output: Path, console: Console) -> None:
 
 def run_validate(*, config_path: Path, console: Console) -> None:
     try:
-        config = load_configuration(config_path)
-        errors = validate_configuration(config) + validate_dependencies(config)
-        if config.installation.provider == "gcp":
-            errors.extend(validate_gcp_credentials())
-        else:
-            profile = config.aws.profile if config.aws else None
-            errors.extend(validate_aws_credentials(profile))
-        if errors:
-            console.print("[red]Configuration is invalid:[/red]")
-            for item in errors:
-                console.print(f"  - {item}")
-            raise SystemExit(1)
+        # Same checks as apply/plan (including EC2 SSH key match when AWS CLI is present).
+        ensure_valid(load_configuration(config_path))
     except ConfigurationError as exc:
         console.print(f"[red]{exc.message}[/red]")
         raise SystemExit(1) from exc
@@ -64,12 +51,21 @@ def run_plan(*, config_path: Path, console: Console) -> None:
         console.print(f"[red]Plan failed[/red] ({exc.stage}): {exc.message}")
         raise SystemExit(1) from exc
     console.print("[bold]Terraform plan summary[/bold]")
-    console.print(result.get("plan_output", ""))
+    # Terraform plan text is already formatted. Highlighting digits breaks
+    # exact comparisons when stdout is a terminal (Rich bolds numbers).
+    console.print(result.get("plan_output", ""), highlight=False)
 
 
-def run_apply(*, config_path: Path, console: Console) -> None:
-    service = _load(config_path)
-    config = service.config
+def run_apply(
+    *, config_path: Path, console: Console, demo: bool | None = None, route53: bool = False
+) -> None:
+    try:
+        config = load_configuration(config_path)
+        prepare_apply(config, config_path=config_path, console=console, demo=demo, route53=route53)
+    except ConfigurationError as exc:
+        console.print(f"[red]{exc.message}[/red]")
+        raise SystemExit(1) from exc
+    service = PlatformDeploymentService(config)
     try:
         result = service.apply()
     except InstallerError as exc:
@@ -80,17 +76,26 @@ def run_apply(*, config_path: Path, console: Console) -> None:
     console.print(f"Installation: {config.installation.name}")
     console.print(f"Services: {', '.join(config.enabled_service_names())}")
     console.print(f"Provider: {config.installation.provider}")
-    if config.installation.provider == "gcp" and config.gcp is not None:
-        console.print(f"Project: {config.gcp.project_id}")
-        console.print(f"Region: {config.gcp.region}")
-        console.print(f"Load balancer IP: {result.outputs.public_ip}")
-    else:
-        console.print(f"Region: {config.aws.region if config.aws else result.outputs.region}")
-        console.print(f"Instance ID: {result.outputs.instance_id}")
-        console.print(f"Public IP: {result.outputs.public_ip}")
+    console.print(f"Region: {config.aws.region if config.aws else result.outputs.region}")
+    console.print(f"Instance ID: {result.outputs.instance_id}")
+    console.print(f"Public IP: {result.outputs.public_ip}")
+    if result.outputs.vpn_gateway_public_ip:
+        port = config.services.vpn.listen_port
+        console.print(f"WireGuard gateway: {result.outputs.vpn_gateway_public_ip}:{port} (UDP)")
     console.print(f"Platform URL: {result.state.platform_url}")
     for key, value in result.health.items():
         console.print(f"{key.replace('_', ' ').title()}: {value}")
+    records = dns_records(config, result.outputs)
+    if records:
+        created = bool(config.aws and config.aws.dns_zone_id.strip() and config.platform.domain)
+        title = (
+            "Route53 records created"
+            if created
+            else "DNS records you need (A records, DNS only, no proxy; see docs/dns.md)"
+        )
+        console.print(f"\n[bold]{title}[/bold]")
+        for name, ip, purpose in records:
+            console.print(f"  {name:<32} -> {ip:<16} {purpose}")
 
 
 def run_status(*, config_path: Path, console: Console) -> None:

@@ -5,7 +5,7 @@
 | Tool | Version | Purpose |
 |------|---------|---------|
 | Python | 3.13+ | Installer |
-| Terraform | 1.5+ | AWS infrastructure |
+| Terraform 1.5+ or OpenTofu 1.6+ | | AWS infrastructure (set `EDGE_INSTALLER_TERRAFORM=tofu` to force OpenTofu; see docs/licensing.md) |
 | Ansible | 2.15+ | Host configuration |
 | OpenSSH | any recent | SSH to EC2 |
 | AWS CLI | recommended | Verify credentials |
@@ -32,7 +32,9 @@ aws sts get-caller-identity
 
 ## SSH key pair
 
-Create in the target region:
+`aws.ssh_key_name` (EC2 key pair in the region) and `aws.ssh_private_key_path` (local PEM) **must be the same key**. `make aws-up` checks that before Terraform when the AWS CLI is available; a mismatch used to create the instance and then fail at SSH.
+
+Create a pair in the target region (AWS returns the private key **once**):
 
 ```bash
 aws ec2 create-key-pair \
@@ -43,15 +45,22 @@ aws ec2 create-key-pair \
 chmod 600 ~/.ssh/edge-platform.pem
 ```
 
+Or import a PEM you already have:
+
+```bash
+aws ec2 import-key-pair \
+  --region eu-central-1 \
+  --key-name edge-platform-local \
+  --public-key-material "$(ssh-keygen -y -f ~/.ssh/edge-platform.pem | base64 -w0)"
+```
+
 Reference in `installation.yaml`:
 
 ```yaml
 aws:
-  ssh_key_name: edge-platform
+  ssh_key_name: edge-platform          # or edge-platform-local after import
   ssh_private_key_path: ~/.ssh/edge-platform.pem
 ```
-
-Ensure the PEM file is non-empty. AWS only returns the private key once at creation.
 
 ## IAM permissions
 
@@ -66,20 +75,16 @@ Scoped EC2 permissions in the deployment region are sufficient.
 
 ## Secrets
 
-Export before `validate`, `plan`, or `apply`:
+`make aws-up` and `make plan` generate these if they are unset (and print them
+after `make aws-up`): `EDGE_PLATFORM_POSTGRES_PASSWORD`,
+`EDGE_PLATFORM_JWT_SECRET`, `EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN`. Saved
+at `~/.meteorcloud/secrets.env`. Export a value first to keep your own.
 
-```bash
-# Required when cloud_app is enabled
-export EDGE_PLATFORM_POSTGRES_PASSWORD='...'
-export EDGE_PLATFORM_JWT_SECRET='...'
+Calling `edge-installer` directly still requires the env vars.
 
-# Optional
-export EDGE_PLATFORM_ADMIN_EMAIL='admin@example.com'
-export EDGE_PLATFORM_ADMIN_PASSWORD='...'
-export EDGE_PLATFORM_ACME_EMAIL='ops@example.com'
-export EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY='...'
-export EDGE_PLATFORM_REDIS_PASSWORD='...'
-```
+Optional: `EDGE_PLATFORM_ADMIN_EMAIL`, `EDGE_PLATFORM_ADMIN_PASSWORD`,
+`EDGE_PLATFORM_ACME_EMAIL`, `EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY`,
+`EDGE_PLATFORM_REDIS_PASSWORD`.
 
 Generate a WireGuard private key:
 
@@ -100,7 +105,7 @@ Set `network.allowed_ssh_cidrs` to your public IP `/32` (or wider for testing).
 ## Deploy
 
 ```bash
-make up
+make aws-up
 ```
 
 See [Install quickstart](install-quickstart.md) and [AWS deployment](aws-deployment.md).

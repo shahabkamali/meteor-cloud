@@ -54,7 +54,8 @@ def read_cpu_percent() -> float | None:
     return round(max(0.0, min(100.0, busy * 100.0)), 1)
 
 
-def read_memory_percent() -> float | None:
+def read_memory_bytes() -> tuple[int, int] | None:
+    """(used, total) bytes, where used excludes reclaimable cache (MemAvailable)."""
     content = _read_text("/proc/meminfo")
     if not content:
         return None
@@ -73,11 +74,19 @@ def read_memory_percent() -> float | None:
             break
     if not total or available is None:
         return None
-    used = max(0, total - available)
+    return max(0, total - available) * 1024, total * 1024
+
+
+def read_memory_percent() -> float | None:
+    reading = read_memory_bytes()
+    if reading is None:
+        return None
+    used, total = reading
     return round(min(100.0, used * 100.0 / total), 1)
 
 
-def read_disk_percent(path: str = "/") -> float | None:
+def read_disk_bytes(path: str = "/") -> tuple[int, int] | None:
+    """(used, total) bytes of the filesystem, as df counts them for normal users."""
     try:
         stats = os.statvfs(path)
     except OSError:
@@ -86,19 +95,56 @@ def read_disk_percent(path: str = "/") -> float | None:
     if total <= 0:
         return None
     free = stats.f_bavail * stats.f_frsize
-    used = max(0, total - free)
+    return max(0, total - free), total
+
+
+def read_disk_percent(path: str = "/") -> float | None:
+    reading = read_disk_bytes(path)
+    if reading is None:
+        return None
+    used, total = reading
     return round(min(100.0, used * 100.0 / total), 1)
 
 
-def read_temperature_c() -> float | None:
-    raw = _read_text("/sys/class/thermal/thermal_zone0/temp")
-    if raw is None:
-        return None
+def read_load_average() -> tuple[float, float, float] | None:
     try:
-        milli = int(raw.strip())
-    except ValueError:
+        one, five, fifteen = os.getloadavg()
+    except (OSError, AttributeError):
         return None
-    return round(milli / 1000.0, 1)
+    return round(one, 2), round(five, 2), round(fifteen, 2)
+
+
+_THERMAL_ROOT = "/sys/class/thermal"
+_PREFERRED_THERMAL_TYPES = ("cpu-thermal", "x86_pkg_temp", "soc-thermal", "cpu")
+
+
+def read_temperature_c() -> float | None:
+    """SoC temperature when available (Pi, many Jetson/NUC boards).
+
+    Prefer zones typed ``cpu-thermal`` / ``x86_pkg_temp`` / ``soc-thermal``, then
+    fall back to ``thermal_zone0`` so one metrics key works across boards.
+    """
+    try:
+        names = sorted(os.listdir(_THERMAL_ROOT))
+    except OSError:
+        names = []
+    typed: list[str] = []
+    for name in names:
+        if not name.startswith("thermal_zone"):
+            continue
+        zone_type = (_read_text(f"{_THERMAL_ROOT}/{name}/type") or "").strip().lower()
+        if zone_type in _PREFERRED_THERMAL_TYPES:
+            typed.append(name)
+    for name in [*typed, "thermal_zone0"]:
+        raw = _read_text(f"{_THERMAL_ROOT}/{name}/temp")
+        if raw is None:
+            continue
+        try:
+            milli = int(raw.strip())
+        except ValueError:
+            continue
+        return round(milli / 1000.0, 1)
+    return None
 
 
 def read_uptime_seconds() -> int | None:
@@ -118,11 +164,23 @@ def collect_metrics(*, sample_cpu: bool = True) -> dict[str, Any]:
         cpu = read_cpu_percent()
         if cpu is not None:
             snapshot["cpu_percent"] = cpu
-    memory = read_memory_percent()
+    memory = read_memory_bytes()
     if memory is not None:
-        snapshot["memory_percent"] = memory
-    disk = read_disk_percent()
+        used, total = memory
+        snapshot["memory_percent"] = round(min(100.0, used * 100.0 / total), 1)
+        snapshot["memory_used_bytes"] = used
+        snapshot["memory_total_bytes"] = total
+    disk = read_disk_bytes()
     if disk is not None:
-        snapshot["disk_percent"] = disk
+        used, total = disk
+        snapshot["disk_percent"] = round(min(100.0, used * 100.0 / total), 1)
+        snapshot["disk_used_bytes"] = used
+        snapshot["disk_total_bytes"] = total
+    load = read_load_average()
+    if load is not None:
+        snapshot["load_1m"], snapshot["load_5m"], snapshot["load_15m"] = load
+    uptime = read_uptime_seconds()
+    if uptime is not None:
+        snapshot["uptime_seconds"] = uptime
     snapshot["temperature_c"] = read_temperature_c()
     return snapshot

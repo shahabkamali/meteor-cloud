@@ -1,0 +1,165 @@
+# Ansible (Docker Compose deployment)
+
+Prepares a Linux server (VM, EC2, on-prem) and runs MeteorCloud on it with the
+Docker Compose bundle in [`deploy/compose/`](../compose/). Ansible does not
+template its own copy of the stack: it copies the repository's Compose files,
+renders a `.env` file from inventory settings, and runs `docker compose`.
+
+Ansible never deploys anything to Kubernetes. For clusters use the
+[Helm chart](../kubernetes/helm/meteorcloud/).
+
+Supported targets: Ubuntu 22.04+, Debian 12+, and RHEL/CentOS/Rocky/AlmaLinux 9+,
+reachable over SSH, with sudo. The application runs in Docker; Ansible only
+installs host packages (Docker Engine, optional WireGuard/firewall) for that OS
+family. Controller: ansible-core 2.15+ (`pip install ansible`; Debian 12's packaged
+2.14 is too old). `make up` on the host installs Ansible into a venv if needed.
+
+## Playbooks
+
+| Playbook | What it does |
+|----------|--------------|
+| `playbooks/site.yml` | `provision.yml` + `deploy.yml` (normal entry point) |
+| `playbooks/provision.yml` | Packages, Docker Engine + Compose, log rotation, optional firewall (UFW or firewalld), directories |
+| `playbooks/deploy.yml` | Imports the enabled service playbooks (`enabled_services`) |
+| `playbooks/upgrade.yml` | Same as `deploy.yml`; set a new `git_ref` or image tags first |
+| `playbooks/destroy.yml` | `docker compose down`; deletes `platform_root` only when `platform_destroy_data=true` |
+| `playbooks/services/cloud_app.yml` | Compose bundle, `.env`, start, first admin, health check |
+| `playbooks/services/vpn.yml` | WireGuard device gateway (when `vpn` is in `enabled_services`; runs before `cloud_app`) |
+| `playbooks/wireguard.yml` | Only the WireGuard gateway, on AWS or on-prem, wherever the control plane runs |
+
+All playbooks are safe to re-run. A second run with unchanged settings reports no changes.
+
+## Roles
+
+| Role | Purpose |
+|------|---------|
+| `meteorcloud` | All settings and defaults (`defaults/main.yml`); listed first in every play |
+| `common` | OS check, base packages, UTC timezone |
+| `docker` | Docker Engine + Compose plugin (`package`; Docker's apt or yum repo), json-file log rotation |
+| `firewall` | UFW or firewalld: SSH from allowed CIDRs, HTTP/HTTPS, MQTT 8883 when the broker is bundled |
+| `platform_directories` | `/opt/edge-platform/` layout with the UIDs the containers need |
+| `platform_config` | Copies `deploy/compose/`, renders `compose/.env` (mode 0600), MQTT certificates |
+| `platform_deployment` | Builds (git) or pulls (registry) images, aligns bundled Postgres password, `docker compose up --wait`, first admin |
+| `health_check` | `/health` and `/` through Traefik, from the host itself |
+| `vpn` | WireGuard gateway (packages, kernel module, forwarding, server key, `wg0`, peer agent), site links, control-plane hand-off |
+
+## Configuration
+
+Settings come from three places:
+
+| Kind | Where |
+|------|-------|
+| Infrastructure choices (database, storage, MQTT, images, firewall) | `inventory/<name>/group_vars/platform.yml` |
+| Secrets | `EDGE_PLATFORM_*` environment variables on the controller, or ansible-vault |
+| Application defaults | `roles/meteorcloud/defaults/main.yml` |
+
+Required secrets: `EDGE_PLATFORM_POSTGRES_PASSWORD` and `EDGE_PLATFORM_JWT_SECRET`.
+Others are required only by the option that uses them, e.g.
+`EDGE_PLATFORM_MQTT_PLATFORM_PASSWORD` and `EDGE_PLATFORM_MQTT_INTERNAL_TOKEN`
+with MQTT, `EDGE_PLATFORM_DATA_PLANE_INTERNAL_TOKEN` with the application data API,
+or `EDGE_PLATFORM_OBJECT_STORAGE_ACCESS_KEY_ID` and
+`EDGE_PLATFORM_OBJECT_STORAGE_SECRET_ACCESS_KEY` with bundled MinIO (optional for
+external S3 when the host has an IAM role). Every run checks these first and fails
+with a clear message. If `EDGE_PLATFORM_MQTT_INTERNAL_TOKEN` is unset, Ansible
+writes a random one to `/opt/edge-platform/secrets/mqtt_internal_token` and reuses
+it. Production rejects the built-in default even when MQTT is off.
+
+Infrastructure options:
+
+| Setting | Values | Default |
+|---------|--------|---------|
+| `postgres_provider` | `bundled`, `external` (`EDGE_PLATFORM_DATABASE_URL`) | `bundled` |
+| `cache_provider` | `memory`, `redis` (`redis_provider`: `bundled` / `external`) | `memory` |
+| `object_storage_provider` | `filesystem`, `s3` (AWS S3, any S3-compatible API, GCS interoperability, or bundled MinIO with `minio_enabled`) | `filesystem` |
+| `mqtt_enabled` / `mqtt_broker` | `false`, or `true` with `bundled` / `external` | `false` |
+| `data_plane_gateway` | MQTT gateway: `go` (MQTT forwarder from `data_api_image`) or `python` (previous gateway from `data_plane_image`, one release; [docs](../../docs/data-plane/mqtt-forwarder.md)) | `go` |
+| `mqtt_provider` | Broker software: `mosquitto`, `emqx`, or `vernemq` (needs `vernemq_accept_eula: "yes"`) | `mosquitto` |
+| `data_api_enabled` / `dataplane_bus` | `false`, or `true` with `memory` / `mqtt` (mqtt needs `mqtt_enabled`) | `false` / `memory` |
+| `dataplane_storage` | `postgres` (default) or `clickhouse` (`EDGE_PLATFORM_CLICKHOUSE_PASSWORD`, Compose profile `clickhouse`) | `postgres` |
+| `nats_enabled` | Device event path (MQTT → JetStream → rule-processor / clickhouse-writer). Needs `mqtt_enabled`, `dataplane_storage=clickhouse`, `EDGE_PLATFORM_DATA_PLANE_INTERNAL_TOKEN`, `EDGE_PLATFORM_CLICKHOUSE_PASSWORD`, and `EDGE_PLATFORM_NATS_*_PASSWORD` | `false` |
+| `observability_enabled` | Prometheus, Loki, Alloy, Alertmanager, Grafana on 127.0.0.1 | `false` |
+| `observability_components` | Any of `metrics`, `logs`, `alerting`, `dashboards` (retention, webhook and external URLs: [Observability](../../docs/observability.md#ansible)) | all four |
+| `image_source` | `git` (build on host), `registry` (pull) | `git` |
+
+With the defaults the host runs only PostgreSQL, the API, the console, and Traefik.
+
+## Run
+
+```bash
+# On this VM / existing server (creates inventory/selfhost, secrets, Ansible venv if needed).
+# Secrets are generated, printed at the end, and saved to ~/.meteorcloud/secrets.env (mode 0600):
+make up
+# make up ARGS=--no-vpn
+# make down                      # stop; data stays
+# make down ARGS=--destroy-data  # also wipe /opt/edge-platform
+
+# From a laptop onto another server:
+cd deploy/ansible
+cp -r inventory/example inventory/production   # ignored by git
+$EDITOR inventory/production/hosts.yml inventory/production/group_vars/platform.yml
+
+export EDGE_PLATFORM_POSTGRES_PASSWORD=... EDGE_PLATFORM_JWT_SECRET=...
+ansible-galaxy collection install -r requirements.yml   # only with ansible-core
+ansible-playbook -i inventory/production/hosts.yml playbooks/site.yml
+```
+
+`edge-installer` (AWS EC2) generates the inventory and extra-vars itself and runs
+the same playbooks; see [AWS deployment](../../docs/aws-deployment.md).
+
+## WireGuard gateway
+
+Installs and runs the WireGuard server devices dial (browser SSH, app
+endpoints) on Ubuntu 22.04+, Debian 12+, or RHEL/CentOS/Rocky/AlmaLinux 9+: an
+AWS EC2 instance or an on-prem server. Ansible installs WireGuard, iptables, the kernel module, and
+persistent forwarding; generates the server key on the gateway once (or uses
+`EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY`); and starts `wg-quick@wg0` and
+`meteorcloud-gateway`. Set `EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN` (or
+`EDGE_PLATFORM_MQTT_INTERNAL_TOKEN`) to the control plane's value. Open UDP
+`vpn_listen_port` (51820) to the gateway.
+
+| Inventory | Gateway | Run |
+|-----------|---------|-----|
+| `platform` only | On the API host | `site.yml` with `enabled_services: [cloud_app, vpn]` |
+| `vpn_gateway` + `platform` | Own server; site link to each API host | same |
+| `vpn_gateway` only | Own server; control plane elsewhere (other cloud, Kubernetes) | `wireguard.yml` |
+
+```bash
+cp -r inventory/example-wireguard-aws inventory/wg-aws      # or example-wireguard-onprem
+$EDITOR inventory/wg-aws/hosts.yml inventory/wg-aws/group_vars/vpn_gateway.yml
+export EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN=...
+ansible-playbook -i inventory/wg-aws/hosts.yml playbooks/wireguard.yml
+```
+
+`wireguard.yml` prints the endpoint and server public key, and writes
+`artifacts/wireguard-<gateway>/control-plane.env` (Compose `.env` lines),
+`helm-values.yaml` (Helm `connectivity.*`), and `wg-link-<name>.conf` for each
+`vpn_site_links` entry. With `platform` hosts in the inventory the API is
+configured directly.
+
+| Setting | Purpose |
+|---------|---------|
+| `vpn_public_host` (host var) | Address devices dial, ideally a DNS name such as `wg.example.com`; default `ansible_host` |
+| `vpn_control_plane_url` | Private API URL for the agent when the control plane is not in the inventory |
+| `vpn_site_links` | `[{name, public_key, address}]` WireGuard links for unmanaged control-plane hosts |
+| `vpn_routed_cidrs` | Private networks (VPC, EKS pods) routed to the gateway; AWS: source/dest check off, route `10.8.0.0/16` to it |
+| `vpn_link_subnet` / `vpn_link_endpoint` | Site-link network (`10.9.0.0/24`) and the address API hosts dial (gateway private IP in one VPC/LAN) |
+| `vpn_server_address` / `vpn_network_cidr` / `vpn_listen_port` | `10.8.0.1/16`, `10.8.0.0/16`, `51820` |
+| `firewall_enabled` (`group_vars/vpn_gateway.yml`) | UFW on the gateway: SSH from `firewall_allowed_ssh_cidrs` and WireGuard only |
+
+The gateway host gets no Docker. Run without `--limit`: the gateway and the API
+hosts exchange site-link keys in one run. Details:
+[Device connectivity](../../docs/fleet/connectivity.md).
+
+## Upgrading from the single-file layout
+
+Hosts deployed before `deploy/compose/` existed have `/opt/edge-platform/docker-compose.yml`.
+The first run of the new playbooks stops that stack, removes the old generated
+files, and starts the new bundle on the same data directories (`data/postgres`,
+`traefik/acme.json`).
+
+## Validation
+
+```bash
+make ansible-check   # syntax-check every playbook
+make ansible-lint    # ansible-lint (production profile)
+```

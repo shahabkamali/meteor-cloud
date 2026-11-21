@@ -1,6 +1,6 @@
 # Edge Platform Installer
 
-Standalone CLI (`edge-installer`) to install and maintain the Edge Platform on AWS EC2 or GCP Cloud Run. The platform application does not know how it was installed.
+Standalone CLI (`edge-installer`) to install and maintain MeteorCloud on an AWS EC2 host: Terraform (`infrastructure/terraform/aws`) creates the host, then the Ansible playbooks in `deploy/ansible/` deploy the Docker Compose stack. The platform application does not know how it was installed. For Kubernetes use the Helm chart instead ([Kubernetes](../../docs/kubernetes.md)).
 
 ## Quick start
 
@@ -15,7 +15,7 @@ export EDGE_PLATFORM_POSTGRES_PASSWORD='...'
 export EDGE_PLATFORM_JWT_SECRET='...'
 
 edge-installer validate ../../installation.yaml
-make -C ../.. up          # or: edge-installer apply ../../installation.yaml
+make -C ../.. aws-up      # or: edge-installer apply ../../installation.yaml
 ```
 
 ## Commands
@@ -25,14 +25,14 @@ make -C ../.. up          # or: edge-installer apply ../../installation.yaml
 | `edge-installer init` | Create sample `installation.yaml` |
 | `edge-installer validate [config]` | Check config, secrets, tools, AWS creds |
 | `edge-installer plan [config]` | Terraform plan (no changes) |
-| `edge-installer apply [config]` | Terraform + Ansible + health check |
+| `edge-installer apply [config]` | Terraform + Ansible + health check. `--route53` finds the domain's Route53 zone and creates the A records; `--demo` seeds Demo Organization |
 | `edge-installer status [config]` | State, infrastructure, health |
 | `edge-installer upgrade [config]` | Update enabled services on existing host |
 | `edge-installer destroy [config]` | Tear down AWS + local state |
 
 Config path can be positional (`installation.yaml`) or `--config installation.yaml`.
 
-Makefile equivalents from repo root: `make up`, `make down`, `make plan`, `make status-aws`.
+Makefile equivalents from repo root: `make aws-up`, `make aws-down`, `make plan`, `make status-aws`. `make up` / `make down` install or stop MeteorCloud on the current VM.
 
 ## Modular services
 
@@ -46,7 +46,7 @@ services:
     enabled: true
 ```
 
-Service definitions live in `edge_installer/services/registry.py`. Each service maps to Terraform modules and Ansible playbooks under `infrastructure/`.
+Service definitions live in `edge_installer/services/registry.py`. Each service maps to Terraform modules under `infrastructure/terraform/aws/modules/` and Ansible playbooks under `deploy/ansible/playbooks/services/`.
 
 See [Modular services](../../docs/services.md).
 
@@ -58,7 +58,6 @@ infrastructure/installer/edge_installer/
 ├── config/           # YAML loading and validation
 ├── services/         # Service registry (cloud_app, vpn, ...)
 ├── providers/aws/    # EC2 Terraform
-├── providers/gcp/    # Cloud Run Terraform
 ├── deployment/       # Ansible, SSH, orchestration
 ├── state/            # Local state and locking
 ├── health/           # Post-deploy checks

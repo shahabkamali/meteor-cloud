@@ -15,7 +15,8 @@ class InstallationSettings(BaseModel):
 
     name: str = Field(min_length=1, max_length=63)
     environment: Literal["development", "staging", "production"]
-    provider: Literal["aws", "gcp"] = "aws"
+    provider: Literal["aws"] = "aws"
+    demo: bool = False
 
 
 class PlatformSettings(BaseModel):
@@ -31,7 +32,8 @@ class AwsSettings(BaseModel):
 
     region: str = Field(min_length=1)
     availability_zone: str | None = None
-    instance_type: str = "t3.small"
+    # auto: pick t3/t4g from enabled containers. A smaller explicit type is raised.
+    instance_type: str = "auto"
     architecture: Literal["amd64", "arm64"] = "amd64"
     ami_id: str | None = None
     ssh_key_name: str = Field(min_length=1)
@@ -39,26 +41,8 @@ class AwsSettings(BaseModel):
     root_volume_size_gb: int = Field(default=30, ge=8, le=1024)
     assign_elastic_ip: bool = True
     profile: str | None = None
-
-
-class GcpSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    project_id: str = Field(min_length=1)
-    region: str = "europe-west1"
-    sql_tier: str = "db-f1-micro"
-    sql_disk_size_gb: int = Field(default=10, ge=10, le=1024)
-    redis_memory_size_gb: int = Field(default=1, ge=1, le=16)
-    deletion_protection: bool = False
-    min_instances: int = Field(default=0, ge=0, le=10)
-    max_instances: int = Field(default=4, ge=1, le=100)
-    backend_cpu: str = "1"
-    backend_memory: str = "1Gi"
-    frontend_cpu: str = "1"
-    frontend_memory: str = "512Mi"
-    create_artifact_registry: bool = True
-    enable_apis: bool = True
-    subnet_cidr: str = "10.20.0.0/24"
+    # With platform.domain, Terraform creates A records in this hosted zone.
+    dns_zone_id: str = ""
 
 
 class NetworkSettings(BaseModel):
@@ -79,9 +63,11 @@ class PostgresComponentSettings(BaseModel):
 
 
 class RedisComponentSettings(BaseModel):
+    """Bundled Redis for shared rate limits; off means in-memory limits (one API process)."""
+
     model_config = ConfigDict(extra="forbid")
 
-    enabled: bool = True
+    enabled: bool = False
     provider: Literal["local"] = "local"
 
 
@@ -105,7 +91,7 @@ class ComponentsSettings(BaseModel):
 class DeploymentSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    repository_url: str = "https://github.com/shahabkamali/MeteorCloud.git"
+    repository_url: str = "https://github.com/meteor-edge/meteor-cloud.git"
     git_ref: str = "master"
     image_source: Literal["git", "registry"] = "git"
     backend_image: str = Field(min_length=1)
@@ -123,6 +109,23 @@ class SecretsSettings(BaseModel):
     source: Literal["environment"] = "environment"
 
 
+class ObservabilityComponents(BaseModel):
+    """Each observability component can be turned off on its own; the platform never depends on them.
+
+    The alert webhook URL is a secret and comes from EDGE_PLATFORM_ALERT_WEBHOOK_URL, not this file.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metrics: bool = True  # Prometheus + node-exporter
+    logs: bool = True  # Loki + Alloy
+    alerting: bool = True  # Alertmanager
+    dashboards: bool = True  # Grafana
+
+    def enabled_names(self) -> list[str]:
+        return [name for name in ("metrics", "logs", "alerting", "dashboards") if getattr(self, name)]
+
+
 class ObservabilitySettings(BaseModel):
     """Ops telemetry sink. LOG_FORMAT setting selects console or JSON log output; /metrics endpoint is always available.
 
@@ -134,6 +137,11 @@ class ObservabilitySettings(BaseModel):
 
     enabled: bool = False
     backend: Literal["prometheus", "cloudwatch"] = "prometheus"
+    components: ObservabilityComponents = Field(default_factory=ObservabilityComponents)
+    # Logs kept by Loki (hours) and metrics kept by Prometheus (whichever limit is hit first).
+    log_retention_hours: int = Field(default=168, ge=24, le=2160)
+    metrics_retention_days: int = Field(default=15, ge=1, le=365)
+    metrics_retention_size: str = Field(default="5GB", pattern=r"^[1-9][0-9]*(MB|GB)$")
 
 
 class CloudAppServiceSettings(BaseModel):
@@ -150,6 +158,30 @@ class VpnServiceSettings(BaseModel):
     network_cidr: str = "10.8.0.0/24"
     allowed_client_cidrs: list[str] = Field(default_factory=lambda: ["0.0.0.0/0"])
     server_address: str = "10.8.0.1/24"
+    # same_host: WireGuard on the cloud_app instance. dedicated: its own EC2 instance
+    # (Terraform module vpn_gateway), joined to the API host by a WireGuard site link.
+    placement: Literal["same_host", "dedicated"] = "same_host"
+    instance_type: str = "t3.micro"
+    root_volume_size_gb: int = Field(default=16, ge=8, le=1024)
+
+
+class MqttServiceSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # bundled: EMQX on the cloud_app instance (TLS 8883). external: devices use broker_host.
+    enabled: bool = False
+    broker: Literal["bundled", "external"] = "bundled"
+    broker_host: str = ""
+    broker_port: int = Field(default=8883, ge=1, le=65535)
+    allowed_client_cidrs: list[str] = Field(default_factory=lambda: ["0.0.0.0/0"])
+
+    @model_validator(mode="after")
+    def _check_broker(self) -> MqttServiceSettings:
+        if self.enabled and self.broker == "external" and not self.broker_host.strip():
+            raise ValueError("services.mqtt.broker_host is required for an external broker")
+        if self.enabled and self.broker == "bundled" and self.broker_port != 8883:
+            raise ValueError("services.mqtt.broker_port must be 8883 for the bundled broker")
+        return self
 
 
 class ServicesSettings(BaseModel):
@@ -157,6 +189,8 @@ class ServicesSettings(BaseModel):
 
     cloud_app: CloudAppServiceSettings = Field(default_factory=CloudAppServiceSettings)
     vpn: VpnServiceSettings = Field(default_factory=VpnServiceSettings)
+    # Deployed by Ansible with cloud_app, not a separate Terraform service.
+    mqtt: MqttServiceSettings = Field(default_factory=MqttServiceSettings)
 
     def enabled_map(self) -> dict[str, bool]:
         return {
@@ -176,7 +210,6 @@ class InstallationConfig(BaseModel):
     installation: InstallationSettings
     platform: PlatformSettings
     aws: AwsSettings | None = None
-    gcp: GcpSettings | None = None
     network: NetworkSettings
     services: ServicesSettings = Field(default_factory=ServicesSettings)
     components: ComponentsSettings = Field(default_factory=ComponentsSettings)
@@ -202,6 +235,4 @@ class InstallationConfig(BaseModel):
         provider = self.installation.provider
         if provider == "aws" and self.aws is None:
             raise ValueError("aws settings are required when installation.provider is aws")
-        if provider == "gcp" and self.gcp is None:
-            raise ValueError("gcp settings are required when installation.provider is gcp")
         return self

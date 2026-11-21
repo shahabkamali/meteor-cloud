@@ -16,13 +16,27 @@ import sys
 import time
 from pathlib import Path
 
+from edge_agent.actions import ActionSync
+from edge_agent.capabilities import collect_capabilities
 from edge_agent.client import AgentApiError, EdgeClient
 from edge_agent.config import AgentConfig, AgentPaths, load_config
 from edge_agent.credentials import read_device_token, read_registration_token_file
 from edge_agent.heartbeat import run_loop, send_heartbeat
+from edge_agent.inventory import collect_inventory
+from edge_agent.platform import combine_heartbeat_handlers
 from edge_agent.registration import register
+from edge_agent.software import manifest_verifier, reconcile_software
+from edge_agent.wifi import WifiSync
 
 logger = logging.getLogger("edge_agent")
+
+
+def _on_heartbeat(client: EdgeClient, device_token: str, config_dir: Path):
+    """Run Wi-Fi and one-off action sync after each heartbeat response."""
+    return combine_heartbeat_handlers(
+        WifiSync(client, device_token).on_heartbeat,
+        ActionSync(client, device_token, config_dir=config_dir).on_heartbeat,
+    )
 
 
 def _paths_from_args(args: argparse.Namespace) -> AgentPaths:
@@ -68,6 +82,9 @@ def _load_or_fail(paths: AgentPaths) -> tuple[AgentConfig, str] | None:
     if config is None:
         print("Agent is not registered. Run 'edge-agent register' first.", file=sys.stderr)
         return None
+    if not (config.device_id or "").strip():
+        print("Device id is missing from the agent config. Re-register the agent.", file=sys.stderr)
+        return None
     device_token = read_device_token(paths.token_path)
     if device_token is None:
         print("Device credential is missing. Re-register the agent.", file=sys.stderr)
@@ -83,9 +100,42 @@ def _cmd_run(args: argparse.Namespace) -> int:
     config, device_token = loaded
     client = EdgeClient(config.server_url)
 
+    artifacts_dir = paths.config_path.parent / "artifacts"
+
+    from edge_agent.wireguard import ConnectivityState, sync_connectivity
+
+    # One schedule per run loop; --once registers every time.
+    wg_state = None if args.once else ConnectivityState()
+
+    from edge_agent.mqtt_sync import MqttSupervisor
+
+    mqtt = (
+        MqttSupervisor(config.device_id, paths.config_path.parent, server_url=config.server_url)
+        if config.device_id and not args.once
+        else None
+    )
+
+    def _payload() -> dict:
+        sync_connectivity(client, device_token, paths.config_path.parent, state=wg_state)
+        if mqtt is not None:
+            try:
+                mqtt.sync(client, device_token)
+            except Exception:
+                logger.exception("MQTT sync failed; continuing with heartbeats")
+        payload: dict = {**collect_inventory(), "capabilities": collect_capabilities()}
+        reports = reconcile_software(
+            client, device_token, artifacts_dir,
+            verifier=manifest_verifier(
+                client, device_token, paths.config_path.parent, config.device_id
+            ),
+        )
+        if reports:
+            payload["software_report"] = reports
+        return payload
+
     if args.once:
         try:
-            response = send_heartbeat(client, device_token)
+            response = send_heartbeat(client, device_token, _payload())
         except AgentApiError as error:
             print(f"Heartbeat failed: {error.message}", file=sys.stderr)
             return 1
@@ -93,34 +143,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     logger.info("Starting heartbeat loop every %ss", config.heartbeat_interval_seconds)
-    mqtt_session = None
-    from edge_agent.mqtt import DeviceMqttSession
-    from edge_agent.mqtt_config import read_mqtt_config
-
     try:
-        try:
-            mqtt_config = read_mqtt_config(paths.config_path.parent)
-            if mqtt_config is not None and config.device_id:
-                mqtt_session = DeviceMqttSession(
-                    config.device_id, mqtt_config, server_url=config.server_url
-                )
-                mqtt_session.start()
-        except Exception:
-            logger.exception("MQTT failed to start; continuing with heartbeats")
+        # MQTT starts (and later restarts) from _payload on each heartbeat.
         run_loop(
             client,
             device_token,
             interval_seconds=config.heartbeat_interval_seconds,
             sleep=time.sleep,
             should_continue=lambda: True,
+            payload_factory=_payload,
+            on_response=_on_heartbeat(client, device_token, paths.config_path.parent),
         )
     except AgentApiError:
         return 1
     except KeyboardInterrupt:  # pragma: no cover - interactive only
         logger.info("Stopping heartbeat loop.")
     finally:
-        if mqtt_session is not None:
-            mqtt_session.stop()
+        if mqtt is not None:
+            mqtt.stop()
     return 0
 
 

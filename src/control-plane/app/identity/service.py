@@ -7,9 +7,10 @@ from datetime import timedelta
 
 from sqlalchemy.orm import Session
 
-from app.audit.service import AuditRecorder
+from app.audit.service import OUTCOME_FAILURE, AuditRecorder
 from app.core.config import Settings, get_settings
 from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.metrics import AUTH_LOGINS
 from app.core.security import create_access_token, hash_password, verify_password
 from app.identity.models import User
 from app.identity.repository import UserRepository
@@ -18,6 +19,7 @@ from app.identity.schemas import (
     UserLoginRequest,
     UserPublic,
     UserRegisterRequest,
+    normalize_email,
 )
 from app.tenancy.repository import OrganizationRepository
 
@@ -41,6 +43,12 @@ class AuthenticationService:
             email=payload.email,
             full_name=payload.full_name,
             password_hash=hash_password(payload.password),
+        )
+        AuditRecorder(self.session).record(
+            actor=user,
+            action="auth.register",
+            resource_type="user",
+            resource_id=user.id,
         )
         self.session.commit()
         self.session.refresh(user)
@@ -66,6 +74,7 @@ class AuthenticationService:
             str(user.id),
             settings=self.settings,
             expires_delta=expires,
+            extra_claims={"ver": user.token_version or 0},
         )
         return TokenResponse(
             access_token=token,
@@ -74,7 +83,12 @@ class AuthenticationService:
         )
 
     def login(self, payload: UserLoginRequest) -> TokenResponse:
-        user = self.authenticate(payload)
+        try:
+            user = self.authenticate(payload)
+        except UnauthorizedError:
+            AUTH_LOGINS.labels(result="failure").inc()
+            self._record_failed_login(payload)
+            raise
         token = self.issue_access_token(user)
         audit = AuditRecorder(self.session)
         organization_ids = [
@@ -89,10 +103,53 @@ class AuthenticationService:
                 organization_id=organization_id,
             )
         self.session.commit()
+        AUTH_LOGINS.labels(result="success").inc()
         return token
+
+    def _record_failed_login(self, payload: UserLoginRequest) -> None:
+        """Audit a refused sign-in. A known account's organizations see it; unknown emails stay global."""
+        self.session.rollback()
+        user = self.users.get_by_email(payload.email)
+        audit = AuditRecorder(self.session)
+        if user is None:
+            audit.record(
+                action="auth.login",
+                resource_type="user",
+                outcome=OUTCOME_FAILURE,
+                actor_type="anonymous",
+                metadata={"reason": "unknown_email", "email": normalize_email(payload.email)[:254]},
+            )
+        else:
+            reason = "inactive" if not user.is_active else "bad_password"
+            organization_ids = [
+                organization.id for organization, _m in OrganizationRepository(self.session).list_for_user(user.id)
+            ] or [None]
+            for organization_id in organization_ids:
+                audit.record(
+                    action="auth.login",
+                    resource_type="user",
+                    resource_id=user.id,
+                    organization_id=organization_id,
+                    outcome=OUTCOME_FAILURE,
+                    actor_type="anonymous",
+                    metadata={"reason": reason},
+                )
+        self.session.commit()
 
     def get_user_by_id(self, user_id: uuid.UUID) -> User | None:
         return self.users.get_by_id(user_id)
+
+    def revoke_all_sessions(self, user: User) -> None:
+        """End every access token issued to this user so far (\"log out everywhere\")."""
+        user.token_version = (user.token_version or 0) + 1
+        self.session.add(user)
+        AuditRecorder(self.session).record(
+            actor=user,
+            action="auth.logout_all",
+            resource_type="user",
+            resource_id=user.id,
+        )
+        self.session.commit()
 
     def require_active_user(self, user_id: uuid.UUID) -> User:
         user = self.users.get_by_id(user_id)

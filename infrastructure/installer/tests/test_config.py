@@ -8,7 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from edge_installer.config.loader import load_configuration
-from edge_installer.config.models import ObservabilitySettings
+from edge_installer.config.models import InstallationSettings, ObservabilitySettings
 from edge_installer.config.validation import validate_configuration
 from edge_installer.exceptions import ConfigurationError
 
@@ -79,6 +79,45 @@ def test_empty_configuration_file(tmp_path: Path) -> None:
         load_configuration(path)
 
 
+def test_validate_allows_external_postgres_with_database_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key.pem"
+    key_path.write_text("key", encoding="utf-8")
+    monkeypatch.delenv("EDGE_PLATFORM_POSTGRES_PASSWORD", raising=False)
+    monkeypatch.setenv("EDGE_PLATFORM_JWT_SECRET", "secret")
+    monkeypatch.setenv(
+        "EDGE_PLATFORM_DATABASE_URL",
+        "postgresql+psycopg://edge:secret@db.example.com:5432/edge_platform",
+    )
+
+    config = load_configuration(EXAMPLE)
+    config.aws.ssh_private_key_path = str(key_path)
+    config.components.postgres.enabled = False
+    errors = validate_configuration(config)
+
+    assert not any("POSTGRES_PASSWORD" in item for item in errors)
+    assert not any("components.postgres must be enabled" in item for item in errors)
+    assert not any("EDGE_PLATFORM_DATABASE_URL" in item for item in errors)
+
+
+def test_validate_rejects_disabled_postgres_without_database_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key.pem"
+    key_path.write_text("key", encoding="utf-8")
+    monkeypatch.delenv("EDGE_PLATFORM_POSTGRES_PASSWORD", raising=False)
+    monkeypatch.delenv("EDGE_PLATFORM_DATABASE_URL", raising=False)
+    monkeypatch.setenv("EDGE_PLATFORM_JWT_SECRET", "secret")
+
+    config = load_configuration(EXAMPLE)
+    config.aws.ssh_private_key_path = str(key_path)
+    config.components.postgres.enabled = False
+    errors = validate_configuration(config)
+
+    assert any("EDGE_PLATFORM_DATABASE_URL" in item for item in errors)
+
+
 def test_validate_reports_missing_secrets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     key_path = tmp_path / "key.pem"
     key_path.write_text("key", encoding="utf-8")
@@ -91,6 +130,35 @@ def test_validate_reports_missing_secrets(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert any("EDGE_PLATFORM_POSTGRES_PASSWORD" in item for item in errors)
     assert any("EDGE_PLATFORM_JWT_SECRET" in item for item in errors)
+
+
+def test_validate_requires_connectivity_token_for_vpn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key.pem"
+    key_path.write_text("key", encoding="utf-8")
+    monkeypatch.delenv("EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN", raising=False)
+    monkeypatch.delenv("EDGE_PLATFORM_MQTT_INTERNAL_TOKEN", raising=False)
+
+    config = load_configuration(EXAMPLE)
+    config.aws.ssh_private_key_path = str(key_path)
+    assert any("EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN" in item for item in validate_configuration(config))
+
+    monkeypatch.setenv("EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN", "token")
+    assert not any("CONNECTIVITY" in item for item in validate_configuration(config))
+
+
+def test_validate_requires_url_safe_mqtt_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_configuration(EXAMPLE)
+    monkeypatch.setenv("EDGE_PLATFORM_MQTT_INTERNAL_TOKEN", "abc/def+==")
+    assert any("MQTT_INTERNAL_TOKEN" in item for item in validate_configuration(config))
+    monkeypatch.setenv("EDGE_PLATFORM_MQTT_INTERNAL_TOKEN", "Abc_def-123.x~")
+    assert not any("MQTT_INTERNAL_TOKEN" in item for item in validate_configuration(config))
+
+
+def test_vpn_placement_defaults_to_same_host() -> None:
+    config = load_configuration(EXAMPLE)
+    assert config.services.vpn.placement == "same_host"
 
 
 def test_validate_reports_missing_ssh_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,53 +240,133 @@ def test_observability_settings_rejects_unknown_field() -> None:
         ObservabilitySettings(enabled=True, backend="prometheus", extra_field="nope")
 
 
-def test_load_gcp_example_configuration() -> None:
-    path = (
-        Path(__file__).resolve().parent.parent
-        / "edge_installer"
-        / "config"
-        / "examples"
-        / "installation.gcp.yaml"
-    )
-    config = load_configuration(path)
 
-    assert config.installation.provider == "gcp"
-    assert config.gcp is not None
-    assert config.gcp.project_id == "your-gcp-project"
-    assert config.aws is None
-    assert config.services.vpn.enabled is False
+def test_gcp_provider_is_rejected() -> None:
+    with pytest.raises(ValidationError):
+        InstallationSettings(name="demo", environment="production", provider="gcp")
 
 
-def test_validate_gcp_skips_ssh_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_validate_dns_zone_needs_domain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key_path = tmp_path / "key.pem"
+    key_path.write_text("key", encoding="utf-8")
     monkeypatch.setenv("EDGE_PLATFORM_POSTGRES_PASSWORD", "secret")
     monkeypatch.setenv("EDGE_PLATFORM_JWT_SECRET", "secret")
-    path = (
-        Path(__file__).resolve().parent.parent
-        / "edge_installer"
-        / "config"
-        / "examples"
-        / "installation.gcp.yaml"
-    )
-    config = load_configuration(path)
+
+    config = load_configuration(EXAMPLE)
+    config.aws.ssh_private_key_path = str(key_path)
+    config.aws.dns_zone_id = "Z123"
+    config.platform.domain = None
     errors = validate_configuration(config)
 
-    assert not any("ssh_private_key_path" in item for item in errors)
-    assert not any("allowed_ssh_cidrs" in item for item in errors)
+    assert any("dns_zone_id requires platform.domain" in item for item in errors)
+
+    config.platform.domain = "fleet.example.com"
+    assert not any("dns_zone_id" in item for item in validate_configuration(config))
 
 
-def test_validate_rejects_vpn_on_gcp(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_external_mqtt_requires_broker_host() -> None:
+    from edge_installer.config.models import MqttServiceSettings
+
+    with pytest.raises(ValueError, match="broker_host"):
+        MqttServiceSettings(enabled=True, broker="external")
+    with pytest.raises(ValueError, match="8883"):
+        MqttServiceSettings(enabled=True, broker="bundled", broker_port=1883)
+
+
+def test_observability_components_and_retention_defaults() -> None:
+    settings = ObservabilitySettings()
+
+    assert settings.components.enabled_names() == ["metrics", "logs", "alerting", "dashboards"]
+    assert settings.log_retention_hours == 168
+    assert settings.metrics_retention_days == 15
+    assert settings.metrics_retention_size == "5GB"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"log_retention_hours": 1},
+        {"metrics_retention_days": 0},
+        {"metrics_retention_size": "5TB"},
+        {"metrics_retention_size": "lots"},
+        {"components": {"tracing": True}},
+    ],
+)
+def test_observability_settings_reject_bad_values(overrides: dict) -> None:
+    with pytest.raises(ValidationError):
+        ObservabilitySettings(**overrides)
+
+
+def _enabled_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    key_path = tmp_path / "key.pem"
+    key_path.write_text("key", encoding="utf-8")
     monkeypatch.setenv("EDGE_PLATFORM_POSTGRES_PASSWORD", "secret")
     monkeypatch.setenv("EDGE_PLATFORM_JWT_SECRET", "secret")
-    path = (
-        Path(__file__).resolve().parent.parent
-        / "edge_installer"
-        / "config"
-        / "examples"
-        / "installation.gcp.yaml"
-    )
-    config = load_configuration(path)
-    config.services.vpn.enabled = True
+    config = load_configuration(EXAMPLE)
+    config.aws.ssh_private_key_path = str(key_path)
+    config.observability.enabled = True
+    monkeypatch.setenv("EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD", "grafana-secret")
+    return config
+
+
+def test_validate_observability_component_dependencies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _enabled_config(tmp_path, monkeypatch)
+    config.observability.components.metrics = False
+    config.observability.components.logs = False
+
     errors = validate_configuration(config)
 
-    assert any("vpn is not supported on GCP" in item for item in errors)
+    assert any("alerting needs components.metrics" in item for item in errors)
+    assert any("dashboards needs components.metrics or components.logs" in item for item in errors)
 
+
+def test_validate_allows_logs_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _enabled_config(tmp_path, monkeypatch)
+    config.observability.components.metrics = False
+    config.observability.components.alerting = False
+
+    errors = validate_configuration(config)
+
+    assert not any("observability" in item for item in errors)
+
+
+def test_validate_rejects_plain_http_alert_webhook(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _enabled_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_WEBHOOK_URL", "http://hooks.example.com/x")
+    assert any("ALERT_WEBHOOK_URL must be an https" in item for item in validate_configuration(config))
+
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_WEBHOOK_URL", "https://")
+    assert any("ALERT_WEBHOOK_URL must be an https" in item for item in validate_configuration(config))
+    for broken in ("https://hooks.example.com:notaport/x", "https://hooks.example.com:99999/x", "https://[broken/x"):
+        monkeypatch.setenv("EDGE_PLATFORM_ALERT_WEBHOOK_URL", broken)
+        assert any("ALERT_WEBHOOK_URL must be an https" in item for item in validate_configuration(config)), broken
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_WEBHOOK_URL", "https://hooks.example.com:8443/x")
+    assert not any("ALERT_WEBHOOK_URL" in item for item in validate_configuration(config))
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_WEBHOOK_URL", "https://hooks.example.com/x")
+    assert not any("ALERT_WEBHOOK_URL" in item for item in validate_configuration(config))
+
+
+def test_validate_alert_heartbeat_url(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _enabled_config(tmp_path, monkeypatch)
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_HEARTBEAT_URL", "https://hc.example.com/ping/x")
+    assert any("HEARTBEAT_URL needs EDGE_PLATFORM_ALERT_WEBHOOK_URL" in item for item in validate_configuration(config))
+
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_WEBHOOK_URL", "https://hooks.example.com/x")
+    assert not any("HEARTBEAT_URL" in item for item in validate_configuration(config))
+
+    monkeypatch.setenv("EDGE_PLATFORM_ALERT_HEARTBEAT_URL", "http://hc.example.com/ping/x")
+    assert any("HEARTBEAT_URL must be an https" in item for item in validate_configuration(config))
+
+
+def test_validate_requires_grafana_password_only_for_dashboards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _enabled_config(tmp_path, monkeypatch)
+    monkeypatch.delenv("EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD")
+
+    assert any("EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD" in item for item in validate_configuration(config))
+
+    config.observability.components.dashboards = False
+    assert not any("GRAFANA" in item for item in validate_configuration(config))

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "edge-agent"
-version = "0.1.0"
+version = "0.4.0"
 description = "Reference Linux agent for the Edge Platform fleet"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,9 +27,13 @@ edge-agent = "edge_agent.main:main"
 [tool.hatch.build.targets.wheel]
 packages = ["edge_agent", "meteorcli"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"../runtime" = "runtime"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+# Include sibling ``device-plane/runtime`` (systemd / future adapters).
+pythonpath = [".", ".."]
 
 [tool.ruff]
 line-length = 120

@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import {
+  allowDeviceReregistration,
   deleteDevice,
   getDevice,
   listDeviceGroups,
@@ -13,16 +14,45 @@ import {
   setDeviceEnabled,
   updateDevice,
 } from "@/api/fleet";
+import { getMyAccess } from "@/api/access";
 import { ApiError } from "@/api/http";
 import { getOrganization } from "@/api/organizations";
 import { useAuth } from "@/auth/AuthContext";
+import { DeviceEndpointsPanel } from "@/components/fleet/DeviceEndpointsPanel";
+import { DeviceLogs } from "@/components/fleet/DeviceLogs";
+import { DeviceMqttStatus } from "@/components/fleet/DeviceMqttStatus";
+import { DeviceNetworkPanel } from "@/components/fleet/DeviceNetworkPanel";
+import { DeviceUplinkPanel } from "@/components/fleet/DeviceUplinkPanel";
+import { DeviceResourceMeters } from "@/components/fleet/DeviceResourceMeters";
+import { DeviceSoftwarePanel } from "@/components/fleet/DeviceSoftwarePanel";
+import { DeviceTelemetryCharts } from "@/components/fleet/DeviceTelemetryCharts";
+import {
+  DeploymentHistoryPanel,
+  DeviceAppsPanel,
+  DeviceLogHistory,
+} from "@/components/fleet/DeviceHistoryPanels";
+import { DeviceTerminal } from "@/components/fleet/DeviceTerminal";
+import { AgentUpdatePanel } from "@/components/fleet/AgentUpdatePanel";
+import { DeviceActionsPanel } from "@/components/fleet/DeviceActionsPanel";
+import { DeviceWifiPanel } from "@/components/fleet/DeviceWifiPanel";
 import { MqttConsole } from "@/components/fleet/MqttConsole";
 import { OneTimeSecretDialog } from "@/components/fleet/OneTimeSecretDialog";
 import { StatusBadge } from "@/components/fleet/StatusBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { canManageFleet } from "@/lib/permissions";
+import { Tabs, type TabItem } from "@/components/ui/tabs";
+import {
+  canManageDeviceUsers,
+  canManageDeviceWifi,
+  canManageDeployments,
+  canManageEndpoints,
+  canManageFleet,
+  canOpenDeviceShell,
+  canRebootDevice,
+  canUpdateDeviceAgent,
+  canViewDeviceLogs,
+} from "@/lib/permissions";
 import { formatDateTime } from "@/lib/utils";
 
 function Detail({ label, value }: { label: string; value: string | null | undefined }) {
@@ -34,13 +64,7 @@ function Detail({ label, value }: { label: string; value: string | null | undefi
   );
 }
 
-function metricText(metrics: Record<string, unknown> | null, key: string): string | null {
-  if (!metrics || metrics[key] == null) {
-    return null;
-  }
-  const value = metrics[key];
-  return typeof value === "number" ? String(value) : String(value);
-}
+type DeviceTab = "overview" | "software" | "network" | "mqtt" | "access" | "settings";
 
 export function DeviceDetailPage() {
   const { organizationId = "", deviceId = "" } = useParams();
@@ -52,6 +76,12 @@ export function DeviceDetailPage() {
   const [rotatedToken, setRotatedToken] = useState<string | null>(null);
   const [pingResult, setPingResult] = useState<string | null>(null);
   const [pinging, setPinging] = useState(false);
+  const [searchParams] = useSearchParams();
+  // `?tab=logs` (e.g. from a Deploy row) lands on Access with logs open: the user asked for them.
+  const logsRequested = searchParams.get("tab") === "logs";
+  const [activeTab, setActiveTab] = useState<DeviceTab>(logsRequested ? "access" : "overview");
+  // Logs are listed on the device over SSH, so nothing is asked until the user opens them.
+  const [logsOpen, setLogsOpen] = useState(logsRequested);
 
   const orgQuery = useQuery({
     queryKey: ["organization", organizationId, token],
@@ -62,6 +92,14 @@ export function DeviceDetailPage() {
     queryKey: ["device", organizationId, deviceId, token],
     queryFn: () => getDevice(token!, organizationId, deviceId),
     enabled: Boolean(token && organizationId && deviceId),
+    // Keeps the MQTT status current, like the WireGuard panel.
+    refetchInterval: 15_000,
+  });
+  const accessQuery = useQuery({
+    queryKey: ["my-access", token],
+    queryFn: () => getMyAccess(token!),
+    enabled: Boolean(token),
+    retry: false,
   });
   const typesQuery = useQuery({
     queryKey: ["device-types", organizationId, token],
@@ -75,16 +113,46 @@ export function DeviceDetailPage() {
   });
 
   const canManage = canManageFleet(orgQuery.data?.current_user_role);
+  const canDeploy = canManageDeployments(orgQuery.data?.current_user_role);
+  const canEndpoints = canManageEndpoints(orgQuery.data?.current_user_role);
+  // Effective permissions cover custom roles; the role check is the fallback.
+  const orgAccess = accessQuery.data?.organizations.find(
+    (entry) => entry.organization_id === organizationId,
+  );
+  const canShell = orgAccess
+    ? orgAccess.permissions.includes("device.shell")
+    : canOpenDeviceShell(orgQuery.data?.current_user_role);
+  const canLogs = orgAccess
+    ? orgAccess.permissions.includes("device.logs")
+    : canViewDeviceLogs(orgQuery.data?.current_user_role);
+  const canWifi = orgAccess
+    ? orgAccess.permissions.includes("device.network")
+    : canManageDeviceWifi(orgQuery.data?.current_user_role);
+  const canPower = orgAccess
+    ? orgAccess.permissions.includes("device.reboot")
+    : canRebootDevice(orgQuery.data?.current_user_role);
+  const canUsers = orgAccess
+    ? orgAccess.permissions.includes("device.users")
+    : canManageDeviceUsers(orgQuery.data?.current_user_role);
+  const canUpdateAgent = orgAccess
+    ? orgAccess.permissions.includes("device.update_agent")
+    : canUpdateDeviceAgent(orgQuery.data?.current_user_role);
 
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: ["device", organizationId, deviceId] });
 
   const enabledMutation = useMutation({
-    mutationFn: (enabled: boolean) =>
-      setDeviceEnabled(token!, organizationId, deviceId, enabled),
+    mutationFn: (enabled: boolean) => setDeviceEnabled(token!, organizationId, deviceId, enabled),
     onSuccess: invalidate,
     onError: (err: unknown) =>
       setError(err instanceof ApiError ? err.message : "Could not update device."),
+  });
+
+  const reregisterMutation = useMutation({
+    mutationFn: () => allowDeviceReregistration(token!, organizationId, deviceId),
+    onSuccess: invalidate,
+    onError: (err: unknown) =>
+      setError(err instanceof ApiError ? err.message : "Could not allow re-registration."),
   });
 
   const rotateMutation = useMutation({
@@ -97,11 +165,28 @@ export function DeviceDetailPage() {
       setError(err instanceof ApiError ? err.message : "Could not rotate credential."),
   });
 
+  const permissionsKnown = !orgQuery.isLoading && !accessQuery.isLoading;
+  const deviceLoaded = Boolean(deviceQuery.data);
+  useEffect(() => {
+    if (!logsRequested || !deviceLoaded || !permissionsKnown) return;
+    if (!canLogs) {
+      // Direct link without the logs permission: don't strand the user on an empty tab.
+      setLogsOpen(false);
+      setActiveTab((tab) => (tab === "access" && !canShell ? "overview" : tab));
+      return;
+    }
+    document.getElementById("device-logs")?.scrollIntoView?.({ block: "start" });
+  }, [logsRequested, deviceLoaded, permissionsKnown, canLogs, canShell]);
+
   if (deviceQuery.isLoading) {
     return <p className="text-muted-foreground">Loading device…</p>;
   }
   if (!deviceQuery.data) {
-    return <p className="text-red-700">Device was not found.</p>;
+    return (
+      <p className="bg-ember text-midnight hover:bg-ember hover:text-midnight">
+        Device was not found.
+      </p>
+    );
   }
   const device = deviceQuery.data;
   const currentName = name ?? device.name;
@@ -114,6 +199,16 @@ export function DeviceDetailPage() {
     "meteorcli mqtt-listen",
     `meteorcli mqtt-listen commands`,
   ].join("\n");
+  const tabs: TabItem<DeviceTab>[] = [
+    { id: "overview", label: "Overview" },
+    { id: "software", label: "Software" },
+    { id: "network", label: "Network" },
+    { id: "mqtt", label: "MQTT" },
+    ...(canShell || canLogs ? [{ id: "access" as const, label: "Access" }] : []),
+    ...(canManage || canUpdateAgent || canPower || canUsers || canWifi
+      ? [{ id: "settings" as const, label: "Settings" }]
+      : []),
+  ];
 
   async function onSave() {
     setError(null);
@@ -200,105 +295,237 @@ export function DeviceDetailPage() {
             <h1 className="text-3xl font-semibold tracking-tight">{device.name}</h1>
             <StatusBadge status={device.status} />
           </div>
-          <p className="mt-2 text-muted-foreground">{device.hostname ?? device.mac_addresses[0] ?? "—"}</p>
+          <p className="mt-2 text-muted-foreground">
+            {device.hostname ?? device.mac_addresses[0] ?? "—"}
+          </p>
         </div>
         <Button variant="secondary" asChild>
           <Link to={`/organizations/${organizationId}/devices`}>Back to devices</Link>
         </Button>
       </div>
 
-      {error && <p className="text-sm text-red-700">{error}</p>}
+      {error && (
+        <p className="text-sm font-medium text-midnight bg-ember rounded-md px-2 py-1">{error}</p>
+      )}
 
-      <div className="space-y-3 rounded-lg border border-border bg-white/80 p-6 shadow-sm">
-        <h2 className="text-lg font-semibold">MQTT Connection</h2>
-        <div className="grid gap-4 sm:grid-cols-3">
-          <Detail label="MQTT configured" value={device.mqtt_configured ? "yes" : "no"} />
-          <Detail
-            label="Last MQTT status"
-            value={device.mqtt_status ?? "unknown"}
-          />
-          <Detail
-            label="Last status timestamp"
-            value={device.mqtt_status_at ? formatDateTime(device.mqtt_status_at) : "—"}
-          />
+      <Tabs tabs={tabs} active={activeTab} onChange={setActiveTab} label="Device detail sections" />
+
+      {activeTab === "software" && (
+        <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+          <h2 className="text-lg font-semibold">Software</h2>
+          <p className="text-sm text-muted-foreground">
+            Desired vs installed releases on this device. Empty until a release is deployed.
+          </p>
+          {token && (
+            <DeviceSoftwarePanel
+              token={token}
+              organizationId={organizationId}
+              deviceId={deviceId}
+              canDeploy={canDeploy}
+              deviceOnline={device.status === "online"}
+              onViewLogs={
+                canLogs
+                  ? () => {
+                      setLogsOpen(true);
+                      setActiveTab("access");
+                    }
+                  : undefined
+              }
+            />
+          )}
         </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <Detail label="Device ID" value={device.id} />
-          <Detail
-            label="MAC address"
-            value={device.mac_addresses.length ? device.mac_addresses.join(", ") : null}
-          />
-          <Detail label="MQTT username" value={`device_${device.id}`} />
-          <Detail label="Status topic" value={statusTopic} />
-          <Detail label="Metrics topic" value={metricsTopic} />
-          <Detail label="Commands topic" value={commandsTopic} />
-        </div>
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">On the device</p>
-          <pre className="mt-2 overflow-x-auto rounded-md bg-secondary p-3 text-sm">{meteorcliExamples}</pre>
-        </div>
-        {canManage && (
-          <div className="flex flex-wrap items-center gap-3">
-            <Button onClick={onTestConnection} disabled={pinging}>
-              Test Connection
-            </Button>
-            {pingResult && <p className="text-sm text-green-800">{pingResult}</p>}
+      )}
+
+      {activeTab === "software" && token && (
+        <DeploymentHistoryPanel token={token} organizationId={organizationId} deviceId={deviceId} />
+      )}
+
+      {activeTab === "network" && (
+        <>
+          {canWifi && token && (
+            <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+              <h2 className="text-lg font-semibold">Connection</h2>
+              <DeviceUplinkPanel
+                token={token}
+                organizationId={organizationId}
+                deviceId={deviceId}
+              />
+            </div>
+          )}
+          <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+            <h2 className="text-lg font-semibold">Public URLs</h2>
+            <p className="text-sm text-muted-foreground">
+              Each application on this device can have its own hostname, including different ports
+              such as 80 and 8080.
+            </p>
+            {token && (
+              <DeviceEndpointsPanel
+                token={token}
+                organizationId={organizationId}
+                deviceId={deviceId}
+                canManage={canEndpoints}
+              />
+            )}
           </div>
-        )}
-        {token ? (
-          <MqttConsole
+
+          {token && (
+            <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+              <h2 className="text-lg font-semibold">WireGuard network</h2>
+              <DeviceNetworkPanel
+                token={token}
+                organizationId={organizationId}
+                deviceId={deviceId}
+                canManage={canManage}
+                canShell={canShell}
+              />
+            </div>
+          )}
+        </>
+      )}
+
+      {activeTab === "access" && canShell && token && (
+        <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+          <h2 className="text-lg font-semibold">Terminal</h2>
+          <DeviceTerminal
             token={token}
             organizationId={organizationId}
-            defaultTopic={statusTopic}
-            topicLocked
-            canPublish={canManage}
+            deviceId={deviceId}
+            deviceName={device.name}
           />
-        ) : null}
-      </div>
+        </div>
+      )}
 
-      <div className="grid gap-4 rounded-lg border border-border bg-white/80 p-6 shadow-sm sm:grid-cols-2">
-        <Detail
-          label="CPU %"
-          value={metricText(device.mqtt_metrics, "cpu_percent")}
-        />
-        <Detail
-          label="Memory %"
-          value={metricText(device.mqtt_metrics, "memory_percent")}
-        />
-        <Detail
-          label="Disk %"
-          value={metricText(device.mqtt_metrics, "disk_percent")}
-        />
-        <Detail
-          label="Temperature °C"
-          value={metricText(device.mqtt_metrics, "temperature_c")}
-        />
-        <Detail
-          label="Metrics updated"
-          value={device.mqtt_metrics_at ? formatDateTime(device.mqtt_metrics_at) : null}
-        />
-        <Detail label="Serial number" value={device.serial_number} />
-        <Detail label="Operating system" value={[device.os_name, device.os_version].filter(Boolean).join(" ")} />
-        <Detail label="Kernel" value={device.kernel_version} />
-        <Detail label="Architecture" value={device.architecture} />
-        <Detail label="CPU" value={device.cpu_model} />
-        <Detail label="CPU cores" value={device.cpu_cores ? String(device.cpu_cores) : null} />
-        <Detail label="Memory (MB)" value={device.memory_mb ? String(device.memory_mb) : null} />
-        <Detail label="MAC address" value={device.mac_addresses.join(", ")} />
-        <Detail
-          label="Last seen"
-          value={device.last_seen_at ? formatDateTime(device.last_seen_at) : "Never"}
-        />
-        <Detail label="Created" value={formatDateTime(device.created_at)} />
-        <Detail
-          label="Registered"
-          value={device.registered_at ? formatDateTime(device.registered_at) : null}
-        />
-        <Detail label="Credential prefix" value={device.credential_prefix} />
-      </div>
+      {activeTab === "access" && canLogs && token && (
+        <div
+          id="device-logs"
+          className="scroll-mt-6 space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-lg font-semibold">Logs</h2>
+            {logsOpen && (
+              <Button variant="outline" size="sm" onClick={() => setLogsOpen(false)}>
+                Close logs
+              </Button>
+            )}
+          </div>
+          {logsOpen ? (
+            <DeviceLogs
+              token={token}
+              organizationId={organizationId}
+              deviceId={deviceId}
+              deviceName={device.name}
+            />
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-muted-foreground">
+                View and search service, container and system logs on this device.
+              </p>
+              <Button onClick={() => setLogsOpen(true)}>Open logs</Button>
+            </div>
+          )}
+        </div>
+      )}
 
-      {canManage && (
-        <div className="space-y-4 rounded-lg border border-border bg-white/80 p-6 shadow-sm">
+      {activeTab === "access" && canLogs && token && (
+        <DeviceLogHistory token={token} organizationId={organizationId} deviceId={deviceId} />
+      )}
+
+      {activeTab === "mqtt" && (
+        <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+          <h2 className="text-lg font-semibold">MQTT Connection</h2>
+          <DeviceMqttStatus device={device} />
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Detail label="Device ID" value={device.id} />
+            <Detail
+              label="MAC address"
+              value={device.mac_addresses.length ? device.mac_addresses.join(", ") : null}
+            />
+            <Detail label="MQTT username" value={`device_${device.id}`} />
+            <Detail label="Status topic" value={statusTopic} />
+            <Detail label="Metrics topic" value={metricsTopic} />
+            <Detail label="Commands topic" value={commandsTopic} />
+          </div>
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              On the device
+            </p>
+            <pre className="mt-2 overflow-x-auto rounded-md bg-background p-3 text-foreground text-sm">
+              {meteorcliExamples}
+            </pre>
+          </div>
+          {canManage && (
+            <div className="flex flex-wrap items-center gap-3">
+              <Button onClick={onTestConnection} disabled={pinging}>
+                Test Connection
+              </Button>
+              {pingResult && (
+                <p className="text-sm font-medium text-midnight bg-aurora rounded-md px-2 py-1">
+                  {pingResult}
+                </p>
+              )}
+            </div>
+          )}
+          {token ? (
+            <MqttConsole
+              token={token}
+              organizationId={organizationId}
+              defaultTopic={statusTopic}
+              topicLocked
+              canPublish={canManage}
+            />
+          ) : null}
+        </div>
+      )}
+
+      {activeTab === "overview" && (
+        <div className="space-y-4">
+          <div className="grid gap-4 rounded-lg border border-border bg-card p-6 shadow-glow sm:grid-cols-2">
+            <Detail label="Serial number" value={device.serial_number} />
+            <Detail
+              label="Operating system"
+              value={[device.os_name, device.os_version].filter(Boolean).join(" ")}
+            />
+            <Detail label="Kernel" value={device.kernel_version} />
+            <Detail label="Architecture" value={device.architecture} />
+            <Detail label="CPU" value={device.cpu_model} />
+            <Detail label="CPU cores" value={device.cpu_cores ? String(device.cpu_cores) : null} />
+            <Detail
+              label="Memory (MB)"
+              value={device.memory_mb ? String(device.memory_mb) : null}
+            />
+            <Detail label="MAC address" value={device.mac_addresses.join(", ")} />
+            <Detail label="Local IP" value={device.local_ip} />
+            <Detail label="Agent version" value={device.agent_version} />
+            <Detail
+              label="Last seen"
+              value={device.last_seen_at ? formatDateTime(device.last_seen_at) : "Never"}
+            />
+            <Detail label="Created" value={formatDateTime(device.created_at)} />
+            <Detail
+              label="Registered"
+              value={device.registered_at ? formatDateTime(device.registered_at) : null}
+            />
+            <Detail label="Credential prefix" value={device.credential_prefix} />
+          </div>
+          <DeviceResourceMeters
+            metrics={device.mqtt_metrics}
+            updatedAt={device.mqtt_metrics_at ? formatDateTime(device.mqtt_metrics_at) : null}
+          />
+          {token ? (
+            <DeviceTelemetryCharts
+              token={token}
+              organizationId={organizationId}
+              deviceId={deviceId}
+            />
+          ) : null}
+          {token ? (
+            <DeviceAppsPanel token={token} organizationId={organizationId} deviceId={deviceId} />
+          ) : null}
+        </div>
+      )}
+
+      {activeTab === "settings" && canManage && (
+        <div className="space-y-4 rounded-lg border border-border bg-card p-6 shadow-glow">
           <h2 className="text-lg font-semibold">Manage device</h2>
 
           <div className="grid gap-3 md:grid-cols-[1fr_auto]">
@@ -322,7 +549,7 @@ export function DeviceDetailPage() {
               <Label htmlFor="device-type">Device type</Label>
               <select
                 id="device-type"
-                className="flex h-10 w-full rounded-md border border-input bg-white px-3 text-sm"
+                className="flex h-10 w-full rounded-md border border-input bg-field text-foreground px-3 text-sm"
                 value={device.device_type_id ?? ""}
                 onChange={(event) => onAssign("device_type_id", event.target.value)}
               >
@@ -338,7 +565,7 @@ export function DeviceDetailPage() {
               <Label htmlFor="device-group">Device group</Label>
               <select
                 id="device-group"
-                className="flex h-10 w-full rounded-md border border-input bg-white px-3 text-sm"
+                className="flex h-10 w-full rounded-md border border-input bg-field text-foreground px-3 text-sm"
                 value={device.device_group_id ?? ""}
                 onChange={(event) => onAssign("device_group_id", event.target.value)}
               >
@@ -352,26 +579,73 @@ export function DeviceDetailPage() {
             </div>
           </div>
 
+          {device.reregistration_allowed_until && (
+            <p className="text-sm text-muted-foreground">
+              This hardware may register again with a registration token until{" "}
+              {new Date(device.reregistration_allowed_until).toLocaleString()}.
+            </p>
+          )}
           <div className="flex flex-wrap gap-2">
-            <Button
-              variant="outline"
-              onClick={() => enabledMutation.mutate(!device.is_enabled)}
-            >
+            <Button variant="outline" onClick={() => enabledMutation.mutate(!device.is_enabled)}>
               {device.is_enabled ? "Disable device" : "Enable device"}
             </Button>
             <Button variant="secondary" onClick={() => rotateMutation.mutate()}>
               Rotate credential
             </Button>
+            <Button
+              variant="secondary"
+              onClick={() => reregisterMutation.mutate()}
+              title="After re-flashing this device's card: lets it register again with a registration token, for 24 hours"
+            >
+              Allow re-registration
+            </Button>
             {device.credential_prefix && (
-              <Button variant="ghost" className="text-red-700" onClick={onRevokeCredential}>
+              <Button
+                variant="ghost"
+                className="bg-ember text-midnight hover:bg-ember hover:text-midnight"
+                onClick={onRevokeCredential}
+              >
                 Revoke credential
               </Button>
             )}
-            <Button variant="ghost" className="text-red-700" onClick={onDelete}>
+            <Button
+              variant="ghost"
+              className="bg-ember text-midnight hover:bg-ember hover:text-midnight"
+              onClick={onDelete}
+            >
               Delete device
             </Button>
           </div>
         </div>
+      )}
+
+      {activeTab === "settings" && canUpdateAgent && token && (
+        <AgentUpdatePanel
+          token={token}
+          organizationId={organizationId}
+          deviceId={deviceId}
+          agentVersion={device.agent_version}
+        />
+      )}
+
+      {activeTab === "settings" && canManage && (canPower || canUsers) && token && (
+        <DeviceActionsPanel
+          token={token}
+          organizationId={organizationId}
+          deviceId={deviceId}
+          canPower={canPower}
+          canUsers={canUsers}
+        />
+      )}
+
+      {activeTab === "settings" && canManage && canWifi && token && (
+        <>
+          <div className="space-y-3 rounded-lg border border-border bg-card p-6 shadow-glow">
+            <h2 className="text-lg font-semibold">Connection</h2>
+            <DeviceUplinkPanel token={token} organizationId={organizationId} deviceId={deviceId} />
+          </div>
+          <DeviceWifiPanel token={token} organizationId={organizationId} deviceId={deviceId} />
+        </>
       )}
 
       {rotatedToken && (

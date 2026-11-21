@@ -4,16 +4,38 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 
 from edge_installer.config.models import InstallationConfig
+from edge_installer.deployment.sizing import resolve_aws_host
 from edge_installer.exceptions import TerraformExecutionError
 from edge_installer.process.runner import require_success, run_command
 from edge_installer.providers.aws.outputs import TerraformOutputs
 from edge_installer.state.paths import infrastructure_root, terraform_workdir
 
 logger = logging.getLogger(__name__)
+
+# Explicit choice of binary, e.g. EDGE_INSTALLER_TERRAFORM=tofu (OpenTofu, MPL-2.0).
+TERRAFORM_ENV = "EDGE_INSTALLER_TERRAFORM"
+
+
+def terraform_binary() -> str:
+    """The Terraform-compatible CLI to run.
+
+    Terraform >= 1.6 is BSL 1.1 (fine for provisioning, see docs/licensing.md); OpenTofu
+    (MPL-2.0) runs the same configuration. Order: $EDGE_INSTALLER_TERRAFORM, then
+    ``terraform`` on PATH, then ``tofu`` on PATH.
+    """
+    chosen = os.environ.get(TERRAFORM_ENV, "").strip()
+    if chosen:
+        return chosen
+    if shutil.which("terraform"):
+        return "terraform"
+    if shutil.which("tofu"):
+        return "tofu"
+    return "terraform"
 
 
 class TerraformRunner:
@@ -23,9 +45,9 @@ class TerraformRunner:
 
     def prepare(self) -> None:
         source = infrastructure_root() / "terraform" / "aws"
-        modules_source = infrastructure_root() / "terraform" / "modules"
+        modules_source = source / "modules"
         self.workdir.mkdir(parents=True, exist_ok=True)
-        for name in ("main.tf", "variables.tf", "outputs.tf", "versions.tf"):
+        for name in ("main.tf", "variables.tf", "outputs.tf", "versions.tf", ".terraform.lock.hcl"):
             src = source / name
             if src.exists():
                 shutil.copy2(src, self.workdir / name)
@@ -41,6 +63,14 @@ class TerraformRunner:
         if aws is None:
             raise TerraformExecutionError("aws settings are missing", stage="terraform_vars")
         arch = "amd64" if aws.architecture == "amd64" else "arm64"
+        instance_type, root_volume_size_gb, size = resolve_aws_host(cfg)
+        logger.info(
+            "Host size %s, %s GiB disk (~%s MiB for %s)",
+            instance_type,
+            root_volume_size_gb,
+            size.ram_mib,
+            ", ".join(size.reasons),
+        )
         return {
             "installation_name": cfg.installation.name,
             "environment": cfg.installation.environment,
@@ -48,17 +78,28 @@ class TerraformRunner:
             "aws_region": aws.region,
             "aws_profile": aws.profile or "",
             "availability_zone": aws.availability_zone or "",
-            "instance_type": aws.instance_type,
+            "instance_type": instance_type,
             "architecture": arch,
             "ami_id": aws.ami_id or "",
             "ssh_key_name": aws.ssh_key_name,
-            "root_volume_size_gb": aws.root_volume_size_gb,
+            "root_volume_size_gb": root_volume_size_gb,
             "assign_elastic_ip": aws.assign_elastic_ip,
             "allowed_ssh_cidrs": cfg.network.allowed_ssh_cidrs,
             "allow_http": cfg.network.allow_http,
             "allow_https": cfg.network.allow_https,
             "vpn_listen_port": cfg.services.vpn.listen_port,
             "vpn_allowed_client_cidrs": cfg.services.vpn.allowed_client_cidrs,
+            "vpn_placement": cfg.services.vpn.placement,
+            "vpn_instance_type": cfg.services.vpn.instance_type,
+            "vpn_root_volume_size_gb": cfg.services.vpn.root_volume_size_gb,
+            "mqtt_listen_port": (
+                cfg.services.mqtt.broker_port
+                if cfg.services.mqtt.enabled and cfg.services.mqtt.broker == "bundled"
+                else 0
+            ),
+            "mqtt_allowed_client_cidrs": cfg.services.mqtt.allowed_client_cidrs,
+            "platform_domain": cfg.platform.domain or "",
+            "dns_zone_id": aws.dns_zone_id.strip(),
             "tags": {
                 "Installation": cfg.installation.name,
                 "Environment": cfg.installation.environment,
@@ -73,17 +114,17 @@ class TerraformRunner:
         return path
 
     def init(self) -> None:
-        result = run_command(["terraform", "init", "-input=false"], cwd=str(self.workdir))
+        result = run_command([terraform_binary(), "init", "-input=false"], cwd=str(self.workdir))
         require_success(result, error_cls=TerraformExecutionError, stage="terraform_init")
 
     def validate(self) -> None:
-        result = run_command(["terraform", "validate"], cwd=str(self.workdir))
+        result = run_command([terraform_binary(), "validate"], cwd=str(self.workdir))
         require_success(result, error_cls=TerraformExecutionError, stage="terraform_validate")
 
     def plan(self) -> str:
         self.write_tfvars()
         result = run_command(
-            ["terraform", "plan", "-input=false", "-var-file=terraform.tfvars.json"],
+            [terraform_binary(), "plan", "-input=false", "-var-file=terraform.tfvars.json"],
             cwd=str(self.workdir),
         )
         require_success(result, error_cls=TerraformExecutionError, stage="terraform_plan")
@@ -93,7 +134,7 @@ class TerraformRunner:
         self.write_tfvars()
         result = run_command(
             [
-                "terraform",
+                terraform_binary(),
                 "apply",
                 "-input=false",
                 "-auto-approve",
@@ -111,7 +152,7 @@ class TerraformRunner:
         self.write_tfvars()
         result = run_command(
             [
-                "terraform",
+                terraform_binary(),
                 "destroy",
                 "-input=false",
                 "-auto-approve",
@@ -122,7 +163,7 @@ class TerraformRunner:
         require_success(result, error_cls=TerraformExecutionError, stage="terraform_destroy")
 
     def read_outputs(self) -> TerraformOutputs:
-        result = run_command(["terraform", "output", "-json"], cwd=str(self.workdir))
+        result = run_command([terraform_binary(), "output", "-json"], cwd=str(self.workdir))
         require_success(result, error_cls=TerraformExecutionError, stage="terraform_outputs")
         raw = json.loads(result.stdout)
         flattened = {key: value["value"] for key, value in raw.items()}

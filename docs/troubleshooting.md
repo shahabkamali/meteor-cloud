@@ -6,6 +6,7 @@
 |-------|-----|
 | Missing `EDGE_PLATFORM_*` secrets | Export env vars (see [AWS prerequisites](aws-prerequisites.md)) |
 | SSH key path missing | Create key pair; verify `aws.ssh_private_key_path` and `chmod 600` |
+| PEM does not match EC2 key pair | `aws.ssh_key_name` and the PEM are different keys — import the PEM (`aws ec2 import-key-pair`) or point `ssh_key_name` at the matching pair ([AWS prerequisites](aws-prerequisites.md)) |
 | Empty PEM file (`error in libcrypto`) | Recreate key pair — AWS only gives private key once |
 | `vpn requires cloud_app` | Enable `services.cloud_app` or disable `services.vpn` |
 | Tool not found | Install Terraform, Ansible, OpenSSH |
@@ -17,6 +18,7 @@
 | `UnauthorizedOperation` | Add EC2 permissions to IAM policy |
 | `InvalidKeyPair.NotFound` | Create key pair in the **same region** as `aws.region` |
 | `InsufficientInstanceCapacity` | Try another AZ or instance type |
+| Route53 `Tried to create resource record set … but it already exists` | Older installer without `allow_overwrite`; upgrade and re-run `make aws-up ARGS='--route53'`, or delete the leftover A records for `<domain>` / `*.<domain>` |
 
 ## SSH errors
 
@@ -39,54 +41,63 @@ ssh -i ~/.ssh/edge-platform.pem ubuntu@<ip> 'echo ok'
 |---------|-----|
 | `Could not load 'yaml' callback plugin` | Fixed in `ansible.cfg` — use `stdout_callback = default` |
 | `repository_url is undefined` | Re-run apply so extra-vars include git settings; or use role defaults |
-| Playbook fails mid-deploy | Fix issue, then `edge-installer apply installation.yaml` (idempotent) |
+| Playbook fails mid-deploy | On this VM: re-run `make up`. AWS from a laptop: `make aws-up` / `edge-installer apply` (idempotent) |
+| `edge-installer: not found` after `make up` | You are on the VM. Use `make up` (this host). `make aws-up` is only from a laptop that creates a new EC2. |
+| `connectivity_internal_token` empty | Re-run `make up` on the host (it writes the token into extra-vars). |
 
 Manual run:
 
 ```bash
-cd infrastructure/ansible
+cd deploy/ansible
 ansible-playbook playbooks/site.yml \
   -i ../../.installer-state/production/inventory.ini \
   -e @../../.installer-state/production/extra-vars.json
 ```
 
-## PostgreSQL / Docker Compose unhealthy
+`extra-vars.json` has no secrets: export the same `EDGE_PLATFORM_*` variables as
+for the installer before running it.
 
-Common cause: Compose interpolated empty `${POSTGRES_*}` from the host instead of `platform.env`.
+## Docker Compose services unhealthy
 
-Fix on server:
-
-```bash
-ssh -i ~/.ssh/edge-platform.pem ubuntu@<ip>
-sudo docker compose -f /opt/edge-platform/docker-compose.yml down
-sudo rm -rf /opt/edge-platform/data/postgres/*
-sudo chown -R 70:70 /opt/edge-platform/data/postgres
-exit
-edge-installer apply installation.yaml
-```
-
-Check logs:
-
-```bash
-sudo docker compose -f /opt/edge-platform/docker-compose.yml logs postgres
-sudo docker compose -f /opt/edge-platform/docker-compose.yml ps
-```
-
-## Platform health failures
+The stack lives in `/opt/edge-platform/compose` (Compose files plus the rendered
+`.env`). Run Compose there with both files:
 
 ```bash
 ssh -i ~/.ssh/edge-platform.pem ubuntu@<ip>
-sudo docker compose -f /opt/edge-platform/docker-compose.yml logs backend
-sudo docker compose -f /opt/edge-platform/docker-compose.yml logs traefik
-curl -s http://127.0.0.1/api/v1/health
+cd /opt/edge-platform/compose
+sudo docker compose -f docker-compose.yml -f docker-compose.prod.yml ps
+sudo docker compose -f docker-compose.yml -f docker-compose.prod.yml logs --tail 100 backend postgres traefik
+curl -s http://127.0.0.1/health
 ```
+
+Ansible prints the last 150 log lines of every service when `docker compose up --wait` fails.
 
 Common causes:
 
-- Images not built / wrong tag
-- Git repo not pushed before deploy
-- Database credential mismatch
-- DNS not pointing to server (HTTPS)
+- `POSTGRES_PASSWORD` changed after the database was initialised. The official
+  image keeps the first role password in the volume. The next `make up` /
+  `make aws-up` resets that role to the current secret (data stays). To wipe
+  the database instead, stop the stack and empty `/opt/edge-platform/data/postgres`.
+- Images not built or wrong tag (`image_source: registry` needs pushed images).
+- Git ref not pushed before deploy (`image_source: git`).
+- DNS not pointing at the server, so Let's Encrypt cannot issue a certificate.
+
+## Kubernetes
+
+```bash
+kubectl -n meteorcloud get pods,svc,ingress,pvc
+kubectl -n meteorcloud logs deploy/meteorcloud-backend -c migrate   # migrations / first admin
+kubectl -n meteorcloud logs deploy/meteorcloud-backend
+helm -n meteorcloud test meteorcloud --logs
+```
+
+| Symptom | Fix |
+|---------|-----|
+| `helm install` fails with a values error | The chart rejects unsupported combinations; the message names the setting |
+| Backend stuck in `Init` | The `migrate` init container waits for the database; check `DATABASE_URL` and network policies |
+| Console loads but API calls fail | The Ingress must route `/api` to the backend; with `ingress.enabled=false` your own gateway must |
+| Data plane cannot connect to the broker | The broker certificate needs a SAN for the broker Service: `<fullname>-mqtt` (Mosquitto) or `<fullname>-emqx` (EMQX), where `<fullname>` is `<release>-meteorcloud` (or `<release>-<nameOverride>`), just `<release>` when the release name already contains that name, or `fullnameOverride` when set; Helm cuts it to 63 characters; `kubectl get svc` shows it |
+| `ImagePullBackOff` | Push images to a registry the cluster can reach and set `imagePullSecrets` |
 
 ## VPN
 
@@ -94,28 +105,31 @@ Common causes:
 |---------|-----|
 | WireGuard not running | Set `EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY` and re-deploy |
 | Cannot connect | Check UDP port in SG (`services.vpn.listen_port`, default 51820) |
-| No peer config | Add client peers to `/etc/wireguard/wg0.conf` manually (automation future work) |
+| No peer config | Run the gateway agent (`src/device-plane/gateway/connectivity_agent.py`) so it applies `wg set` from the control plane. Do not paste `[Peer]` blocks into `wg0.conf` |
+| Logs window: "did not list its logs" (`log_sources_unavailable`) | Re-run `sudo ./installcli.sh` (installs `meteorcli-logs` and its sudo rule); check `meteorcli logs` on the device |
+| Device has no WG IP | `CONNECTIVITY_PROVIDER=wireguard`, `wireguard-tools` installed, and `meteorcli run` (passwordless sudo for the `meteorcli-wg` helper from `installcli.sh`; re-run `sudo ./installcli.sh` after upgrading) |
+| Deploy systemd unit: Permission denied on `/etc/systemd/system` | `meteorcli run` is not root. Re-run the installer as root to add the `meteorcli-systemd` helper: `curl -fsSL https://github.com/meteor-edge/meteor-cloud/releases/latest/download/install-meteorcli.sh \| sudo bash` (from a checkout: `sudo ./installcli.sh`). A root install also starts `meteorcli.service`, which runs as root |
+| Browser terminal fails | Device `sshd` up, `SHELL_PROVIDER=ssh_gateway`, gateway host can route to `10.8.0.0/16`, connectivity status `active` |
+| Browser: `UNPROTECTED PRIVATE KEY` then Permission denied | Platform key must be `0600`. Re-run `make up`, or `sudo chmod 600 /opt/edge-platform/shell/id_ed25519` then Reconnect. Do not use `0640` or group `meteorcloud-shell` |
+| Device card shows **Reconnecting** | The agent checks in but the tunnel is down. On the device: `sudo wg show` (handshake?), UDP 51820 reachable, `vpn.<domain>` resolves. The agent re-resolves the DNS name and restarts `wg0` on its own |
+| `wireguard_key_changed` in the agent log | The device presented a new WireGuard key (reinstalled or cloned). Verify it, then **Re-enroll** on the device page |
+| `Host key verification failed` / "host key changed" | The device's sshd key differs from the one pinned at enrollment. Check the device (reinstall?), then **Re-enroll** it to trust the new key |
+| `device_offline` when opening a terminal | No WireGuard handshake in the last 3 minutes; see Reconnecting |
+| `shell_certificate_required` | The shared gateway key is retired but this device does not trust the SSH CA yet. Update the agent and run `meteorcli run`; the device card should show **SSH auth: certificate** |
+| `shell_certificate_failed` | The API could not sign a session certificate. Check that `SHELL_SSH_CA_FILE` exists in the API container, is `0600` and readable by the API user, and that `ssh-keygen` is installed |
+| Device card shows **SSH auth: shared key** after an agent update | The agent installs the CA line in the SSH user's `~/.ssh/authorized_keys`; check that file (line ending in `meteorcloud-ca`) and the agent log |
+| `meteorcloud-ssh: … is revoked` | Access was revoked; re-enroll the device to restore it |
+| `meteorcloud-ssh` cannot read the key | Use `~/.config/meteorcloud/shell/id_ed25519` (`make up` copies it, mode `0600`). Do not chmod the platform key so the group can read it |
 
 ## Security notes
 
-This deployment is suitable for demos and early production. Not included: full OS hardening, WAF, centralized monitoring, automated backups.
+This deployment is suitable for demos and early production. Not included: full OS hardening, WAF, centralized monitoring. Nightly local backups are on by default ([Backups and restore](backups.md)); copy them off the host with `backup_s3_uri`.
 
 Lock down `network.allowed_ssh_cidrs` to your IP in production.
 
-## GCP Cloud Run
-
-| Error | Fix |
-|-------|-----|
-| GCP credentials are not configured | `gcloud auth application-default login` or set `GOOGLE_APPLICATION_CREDENTIALS` |
-| `services.vpn is not supported` | Set `services.vpn.enabled: false` |
-| Cloud Run image not found | Push `deployment.backend_image` / `frontend_image` to Artifact Registry first |
-| Health check timeout | Images must exist; first boot runs migrations. Increase `health_check_timeout_seconds` |
-| Managed cert still provisioning | Point DNS at the load balancer IP; Google certs can take minutes |
-
-See [GCP Cloud Run](gcp-deployment.md).
-
 ## Related
 
-- [GCP Cloud Run](gcp-deployment.md)
+- [Deployment (Compose + Ansible)](deployment.md)
+- [Kubernetes](kubernetes.md)
 - [Install quickstart](install-quickstart.md)
 - [AWS deployment](aws-deployment.md)

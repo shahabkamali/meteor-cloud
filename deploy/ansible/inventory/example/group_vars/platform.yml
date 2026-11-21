@@ -1,0 +1,55 @@
+---
+# Settings for the hosts in the `platform` group. Every setting and its default
+# is listed in roles/meteorcloud/defaults/main.yml. Secrets are read from
+# EDGE_PLATFORM_* environment variables on the controller (or use ansible-vault).
+
+platform_public_url: https://fleet.example.com
+platform_domain: fleet.example.com   # empty: plain HTTP on port 80
+
+# Images: build from git on the host, or pull prebuilt images from a registry.
+image_source: git
+git_ref: master
+# image_source: registry   # signed release images, see docs/release-images.md
+# backend_image: ghcr.io/meteor-edge/meteorcloud-backend:0.2.0
+# data_plane_image: ghcr.io/meteor-edge/meteorcloud-data-plane:0.2.0
+# data_api_image: ghcr.io/meteor-edge/meteorcloud-data-api:0.2.0   # also runs the MQTT forwarder
+# mosquitto_image: ghcr.io/meteor-edge/meteorcloud-mosquitto:0.2.0
+# frontend_image: ghcr.io/meteor-edge/meteorcloud-console:0.2.0
+
+# Application data API (SDK). Needs EDGE_PLATFORM_DATA_PLANE_INTERNAL_TOKEN.
+# data_api_enabled: true
+# dataplane_bus: memory   # or mqtt (requires mqtt_enabled)
+# dataplane_storage: postgres   # or clickhouse (needs EDGE_PLATFORM_CLICKHOUSE_PASSWORD)
+# nats_enabled: false   # MQTT → JetStream device path (needs mqtt_enabled + clickhouse + EDGE_PLATFORM_NATS_*_PASSWORD)
+
+# PostgreSQL: bundled container, or external (EDGE_PLATFORM_DATABASE_URL).
+postgres_provider: bundled
+
+# Rate limiting: memory needs no Redis (single API process).
+cache_provider: memory
+
+# Artifacts: filesystem on this host, or any S3-compatible service.
+object_storage_provider: filesystem
+# object_storage_provider: s3
+# object_storage_endpoint_url: https://s3.example.com   # empty for AWS S3
+# object_storage_bucket: meteorcloud-artifacts
+# minio_enabled: true                                   # bundled MinIO instead
+
+# Device MQTT (TLS 8883): bundled Mosquitto broker with a self-signed CA by default.
+# mqtt_provider: mosquitto   # or emqx / vernemq (docs/fleet/mqtt.md, docs/licensing.md)
+mqtt_enabled: false
+# data_plane_gateway: go   # MQTT gateway; python = the previous gateway (one release)
+# mqtt_broker: external
+# mqtt_broker_host: mqtt.example.com
+# mqtt_certs_src_dir: /path/on/controller/with/ca.crt,server.crt,server.key
+
+# Browser SSH (device page Terminal). Default is ssh_gateway when `vpn` is
+# enabled; set none to keep the tunnel without the terminal.
+# shell_provider: none
+# Extra logins that get ~/.config/meteorcloud/shell/id_ed25519 (ansible_user,
+# ubuntu, and debian already do):
+# shell_ssh_operator_users: [admin]
+
+# Host firewall (UFW) for on-prem servers without a cloud security group.
+firewall_enabled: true
+firewall_allowed_ssh_cidrs: ["198.51.100.0/24"]

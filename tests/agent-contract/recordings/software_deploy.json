@@ -1,0 +1,443 @@
+{
+  "scenario": "software_deploy",
+  "contract": "contracts/device-agent-v1.md",
+  "http": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/agent/register",
+        "headers": {
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": {
+          "agent_version": "<inventory>",
+          "architecture": "<inventory>",
+          "cpu_cores": "<inventory>",
+          "cpu_model": "<inventory>",
+          "hardware_model": "<inventory>",
+          "hostname": "<inventory>",
+          "kernel_version": "<inventory>",
+          "local_ip": "<inventory>",
+          "mac_addresses": "<inventory>",
+          "memory_mb": "<inventory>",
+          "os_name": "<inventory>",
+          "os_version": "<inventory>",
+          "serial_number": "<inventory>",
+          "token": "<registration_token>"
+        }
+      },
+      "response": {
+        "status": 201,
+        "headers": {},
+        "body": {
+          "device_id": "<uuid:1>",
+          "device_token": "<device_token>",
+          "organization_id": "<uuid:2>",
+          "name": "contract-device",
+          "heartbeat_interval_seconds": 60,
+          "mqtt": null
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/agent/heartbeat",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": {
+          "agent_version": "<inventory>",
+          "architecture": "<inventory>",
+          "capabilities": {
+            "systemd": true,
+            "docker": true,
+            "docker_compose": true,
+            "wireguard": true,
+            "ssh": true,
+            "actions": [],
+            "deploy_kinds": [
+              "systemd",
+              "docker",
+              "docker_compose"
+            ],
+            "modules": {
+              "deploy": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
+              "heartbeat": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
+              "identity": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
+              "socket": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              }
+            }
+          },
+          "cpu_cores": "<inventory>",
+          "cpu_model": "<inventory>",
+          "hardware_model": "<inventory>",
+          "hostname": "<inventory>",
+          "kernel_version": "<inventory>",
+          "local_ip": "<inventory>",
+          "mac_addresses": "<inventory>",
+          "memory_mb": "<inventory>",
+          "os_name": "<inventory>",
+          "os_version": "<inventory>",
+          "serial_number": "<inventory>"
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "device_id": "<uuid:1>",
+          "status": "online",
+          "heartbeat_interval_seconds": 5,
+          "server_time": "<timestamp>",
+          "desired_software": [],
+          "wifi_pending": false,
+          "actions_pending": false
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/agent/software",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": [
+          {
+            "workload_key": "demo-app",
+            "kind": "docker",
+            "release_id": "<uuid:3>",
+            "release_name": "demo",
+            "release_version": "1.0.0",
+            "artifact_id": "<uuid:4>",
+            "revision": 1,
+            "artifact_sha256": "8c4f039fe33d50f03d283e39185103ce474034f802886f7a9e8f635d957ee8d2",
+            "spec": {
+              "container_name": "demo-app",
+              "ports": [
+                "8080:80"
+              ],
+              "restart": "unless-stopped"
+            },
+            "key_id": "org-key-1",
+            "signature": "<signature>"
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/agent/signing-keys",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": [
+          {
+            "key_id": "org-key-1",
+            "algorithm": "ed25519",
+            "public_key": "A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+            "endorsed_by": null,
+            "endorsement": null,
+            "created_at": "<timestamp>",
+            "retired_at": null
+          }
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/agent/heartbeat",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": {
+          "software_report": [
+            {
+              "health": "unknown",
+              "progress_percent": 0,
+              "sync_status": "updating",
+              "workload_key": "demo-app"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "device_id": "<uuid:1>",
+          "status": "online",
+          "heartbeat_interval_seconds": 5,
+          "server_time": "<timestamp>",
+          "desired_software": [],
+          "wifi_pending": false,
+          "actions_pending": false
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/agent/artifacts/<uuid:4>/download",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1",
+          "x-meteorcli-redirect": "1"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 302,
+        "headers": {
+          "Location": "<server>/storage/<uuid:4>?X-Amz-Signature=abc",
+          "X-Checksum-SHA256": "8c4f039fe33d50f03d283e39185103ce474034f802886f7a9e8f635d957ee8d2",
+          "Cache-Control": "no-store"
+        },
+        "body": null
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/storage/<uuid:4>",
+        "headers": {},
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "base64": "ZG9ja2VyIHNhdmUgdGFyYmFsbCBvZiBkZW1vL2FwcDoxLjAgKHNpbXVsYXRlZCkK"
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/agent/heartbeat",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": {
+          "software_report": [
+            {
+              "health": "unknown",
+              "progress_percent": 99,
+              "sync_status": "updating",
+              "workload_key": "demo-app"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "device_id": "<uuid:1>",
+          "status": "online",
+          "heartbeat_interval_seconds": 5,
+          "server_time": "<timestamp>",
+          "desired_software": [],
+          "wifi_pending": false,
+          "actions_pending": false
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/agent/heartbeat",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": {
+          "software_report": [
+            {
+              "health": "unknown",
+              "progress_percent": 100,
+              "sync_status": "updating",
+              "workload_key": "demo-app"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "device_id": "<uuid:1>",
+          "status": "online",
+          "heartbeat_interval_seconds": 5,
+          "server_time": "<timestamp>",
+          "desired_software": [],
+          "wifi_pending": false,
+          "actions_pending": false
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/api/v1/agent/heartbeat",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": {
+          "agent_version": "<inventory>",
+          "architecture": "<inventory>",
+          "capabilities": {
+            "systemd": true,
+            "docker": true,
+            "docker_compose": true,
+            "wireguard": true,
+            "ssh": true,
+            "actions": [],
+            "deploy_kinds": [
+              "systemd",
+              "docker",
+              "docker_compose"
+            ],
+            "modules": {
+              "deploy": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
+              "heartbeat": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
+              "identity": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              },
+              "socket": {
+                "state": "running",
+                "restarts": 0,
+                "since": "<timestamp>"
+              }
+            }
+          },
+          "cpu_cores": "<inventory>",
+          "cpu_model": "<inventory>",
+          "hardware_model": "<inventory>",
+          "hostname": "<inventory>",
+          "kernel_version": "<inventory>",
+          "local_ip": "<inventory>",
+          "mac_addresses": "<inventory>",
+          "memory_mb": "<inventory>",
+          "os_name": "<inventory>",
+          "os_version": "<inventory>",
+          "serial_number": "<inventory>",
+          "software_report": [
+            {
+              "health": "healthy",
+              "installed_release_id": "<uuid:3>",
+              "installed_version": "1.0.0",
+              "last_error": null,
+              "progress_percent": 100,
+              "sync_status": "in_sync",
+              "workload_key": "demo-app"
+            }
+          ]
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": {
+          "device_id": "<uuid:1>",
+          "status": "online",
+          "heartbeat_interval_seconds": 5,
+          "server_time": "<timestamp>",
+          "desired_software": [],
+          "wifi_pending": false,
+          "actions_pending": false
+        }
+      }
+    },
+    {
+      "request": {
+        "method": "GET",
+        "path": "/api/v1/agent/software",
+        "headers": {
+          "authorization": "Bearer <device_token>",
+          "user-agent": "meteorcli/<version>",
+          "x-meteor-agent-protocol": "1"
+        },
+        "body": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {},
+        "body": [
+          {
+            "workload_key": "demo-app",
+            "kind": "docker",
+            "release_id": "<uuid:3>",
+            "release_name": "demo",
+            "release_version": "1.0.0",
+            "artifact_id": "<uuid:4>",
+            "revision": 1,
+            "artifact_sha256": "8c4f039fe33d50f03d283e39185103ce474034f802886f7a9e8f635d957ee8d2",
+            "spec": {
+              "container_name": "demo-app",
+              "ports": [
+                "8080:80"
+              ],
+              "restart": "unless-stopped"
+            },
+            "key_id": "org-key-1",
+            "signature": "<signature>"
+          }
+        ]
+      }
+    }
+  ]
+}

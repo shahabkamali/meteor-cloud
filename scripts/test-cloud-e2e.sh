@@ -36,7 +36,7 @@ INSTALLATION_NAME="${INSTALLATION_NAME:-e2e-test-$(date +%s)}"
 export INSTALLATION_NAME
 
 if [[ ! -x "$(command -v edge-installer || true)" ]]; then
-  "$PYTHON" -m pip install -e "installer/.[dev]" >/dev/null
+  "$PYTHON" -m pip install -e "infrastructure/installer/.[dev]" >/dev/null
 fi
 
 applied=0
@@ -44,16 +44,16 @@ applied=0
 destroy() {
   if [[ "$applied" -eq 1 ]]; then
     echo "==> Destroying AWS test infrastructure"
-    (cd "$ROOT/installer" && edge-installer destroy "$CONFIG" --yes) || true
+    (cd "$ROOT/infrastructure/installer" && edge-installer destroy "$CONFIG" --yes) || true
   fi
 }
 trap destroy EXIT
 
 echo "==> Terraform plan (no apply)"
-(cd "$ROOT/installer" && edge-installer plan "$CONFIG")
+(cd "$ROOT/infrastructure/installer" && edge-installer plan "$CONFIG")
 
 echo "==> Terraform apply + Ansible deploy ($INSTALLATION_NAME)"
-(cd "$ROOT/installer" && edge-installer apply "$CONFIG")
+(cd "$ROOT/infrastructure/installer" && edge-installer apply "$CONFIG")
 applied=1
 
 {
@@ -84,8 +84,7 @@ export PLATFORM_URL MQTT_HOST MQTT_PORT
 export MQTT_ALLOW_BROKER_RESTART=0
 
 echo "==> HTTPS health"
-chmod +x scripts/aws-ci-smoke.sh
-scripts/aws-ci-smoke.sh "$PLATFORM_URL"
+"$PYTHON" scripts/smoke_test.py "$PLATFORM_URL"
 
 echo "==> MQTT TLS :${MQTT_PORT}"
 if "$PYTHON" - <<'PY'
@@ -96,15 +95,21 @@ from mqtt_live.http import wait_mqtt_tls
 host = os.environ.get("MQTT_HOST") or ""
 ca = os.environ.get("MQTT_CA_FILE") or ""
 if not host:
+    print("MQTT probe: no MQTT_HOST", file=sys.stderr)
     sys.exit(2)
 try:
     wait_mqtt_tls(host, int(os.environ.get("MQTT_PORT", "8883")), ca, timeout_seconds=45)
-except Exception:
+except Exception as exc:
+    print(f"MQTT probe: {type(exc).__name__}: {exc}", file=sys.stderr)
     sys.exit(2)
 PY
 then
   echo "==> MQTT live tests against deployed broker"
   "$PYTHON" -m pytest -q tests/mqtt_live
 else
-  echo "Cloud MQTT: NOT RUN (:${MQTT_PORT} is not reachable; production compose does not deploy EMQX yet)"
+  if [[ "${MQTT_EXPECTED:-}" == "1" ]]; then
+    echo "Cloud MQTT: FAILED (MQTT_EXPECTED=1 but TLS on ${MQTT_HOST:-?}:${MQTT_PORT} did not answer)" >&2
+    exit 1
+  fi
+  echo "Cloud MQTT: NOT RUN (TLS on ${MQTT_HOST:-?}:${MQTT_PORT} did not answer; this deployment has no reachable broker. Set MQTT_EXPECTED=1 to make this a failure)"
 fi

@@ -1,0 +1,480 @@
+import { FormEvent, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  createRelease,
+  listArtifacts,
+  type Artifact,
+  type Release,
+  type ReleaseCreatePayload,
+  type ReleaseKind,
+} from "@/api/fleet";
+import { ApiError } from "@/api/http";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { ARTIFACT_TYPE_FOR_KIND } from "@/components/releases/releaseArtifacts";
+import { parseYamlObject } from "@/lib/yaml";
+
+const SELECT_CLASS =
+  "flex h-10 w-full rounded-md border border-input bg-field text-foreground px-3 text-sm";
+
+/** Kinds offered in the create form today. More (e.g. AI models) can be added later. */
+const RELEASE_KINDS: { id: ReleaseKind; label: string; hint: string }[] = [
+  {
+    id: "systemd",
+    label: "systemd service",
+    hint: "A Linux service installed and managed with systemctl",
+  },
+  {
+    id: "docker",
+    label: "Single container",
+    hint: "One container via docker run (pull an image or load a tarball)",
+  },
+  {
+    id: "docker_compose",
+    label: "Compose application",
+    hint: "An app defined by Docker Compose (one or more services)",
+  },
+];
+
+type CreateReleaseDialogProps = {
+  token: string;
+  organizationId: string;
+  /** Start from this artifact (e.g. "Create release" on an artifact row): kind and artifact preselected. */
+  initialArtifact?: { id: string; kind: ReleaseKind; name?: string; version?: string } | null;
+  onClose: () => void;
+  onCreated: (release: Release) => void;
+};
+
+export function CreateReleaseDialog({
+  token,
+  organizationId,
+  initialArtifact = null,
+  onClose,
+  onCreated,
+}: CreateReleaseDialogProps) {
+  const [mode, setMode] = useState<"form" | "yaml">("form");
+  const [kind, setKind] = useState<ReleaseKind>(initialArtifact?.kind ?? "systemd");
+  const [name, setName] = useState(initialArtifact?.name ?? "");
+  const [version, setVersion] = useState(initialArtifact?.version ?? "");
+  const [artifactId, setArtifactId] = useState(initialArtifact?.id ?? "");
+  const [unitName, setUnitName] = useState("");
+  const [containerName, setContainerName] = useState("");
+  const [image, setImage] = useState("");
+  const [projectName, setProjectName] = useState("");
+  const [description, setDescription] = useState("");
+  const [healthGate, setHealthGate] = useState(false);
+  const [healthUrl, setHealthUrl] = useState("");
+  const [yamlText, setYamlText] = useState(
+    [
+      "name: camera-agent",
+      "version: 1.2.0",
+      "kind: systemd",
+      "artifact_id: null",
+      "description: null",
+      "spec:",
+      "  unit_name: camera-agent.service",
+      "  start: true",
+    ].join("\n"),
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const artifactType = ARTIFACT_TYPE_FOR_KIND[kind];
+  const artifactsQuery = useQuery({
+    queryKey: ["artifacts", organizationId, artifactType, token],
+    queryFn: () =>
+      listArtifacts(token, organizationId, {
+        type: artifactType,
+        page_size: 100,
+      }),
+    enabled: Boolean(token && organizationId),
+  });
+
+  const artifacts: Artifact[] = artifactsQuery.data?.items ?? [];
+  const artifactOptions = useMemo(() => {
+    const options = artifacts.map((item) => ({
+      id: item.id,
+      label: `${item.name} ${item.version} (${item.file_name})`,
+    }));
+    // The list holds the first 100 artifacts; keep the preselected one visible when it is not among them.
+    if (
+      initialArtifact &&
+      initialArtifact.kind === kind &&
+      !options.some((item) => item.id === initialArtifact.id)
+    ) {
+      const label = [initialArtifact.name, initialArtifact.version].filter(Boolean).join(" ");
+      options.unshift({ id: initialArtifact.id, label: label || initialArtifact.id });
+    }
+    return options;
+  }, [artifacts, initialArtifact, kind]);
+
+
+  const kindMeta = RELEASE_KINDS.find((item) => item.id === kind)!;
+  const artifactRequired = kind !== "docker";
+  const canSubmit =
+    !saving &&
+    name.trim() &&
+    version.trim() &&
+    (kind !== "docker" || Boolean(artifactId) || Boolean(image.trim())) &&
+    (kind !== "systemd" || (Boolean(artifactId) && Boolean(unitName.trim()))) &&
+    (kind !== "docker_compose" || (Boolean(artifactId) && Boolean(projectName.trim()))) &&
+    (kind !== "docker" || Boolean(containerName.trim()));
+
+  async function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+
+    if (kind === "systemd") {
+      if (!artifactId) {
+        setError("Choose an artifact for this release.");
+        return;
+      }
+      if (!unitName.trim()) {
+        setError("Unit name is required.");
+        return;
+      }
+    }
+    if (kind === "docker") {
+      if (!containerName.trim()) {
+        setError("Container name is required.");
+        return;
+      }
+      if (!artifactId && !image.trim()) {
+        setError("Provide an image name or a docker tarball artifact.");
+        return;
+      }
+    }
+    if (kind === "docker_compose") {
+      if (!artifactId) {
+        setError("Choose a compose artifact for this release.");
+        return;
+      }
+      if (!projectName.trim()) {
+        setError("Project name is required.");
+        return;
+      }
+    }
+
+    let spec: Record<string, unknown>;
+    if (kind === "systemd") {
+      spec = { unit_name: unitName.trim(), start: true };
+    } else if (kind === "docker") {
+      spec = {
+        container_name: containerName.trim(),
+        ...(image.trim() ? { image: image.trim() } : {}),
+      };
+    } else {
+      spec = { project_name: projectName.trim() };
+    }
+    if (healthGate) {
+      spec.health_check = healthUrl.trim() ? { http_url: healthUrl.trim() } : {};
+    }
+
+    setSaving(true);
+    try {
+      const release = await createRelease(token, organizationId, {
+        name: name.trim(),
+        version: version.trim(),
+        kind,
+        artifact_id: artifactId || null,
+        description: description.trim() || null,
+        spec,
+      });
+      onCreated(release);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not create the release.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function onSubmitYaml(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    let payload: ReleaseCreatePayload;
+    try {
+      const raw = parseYamlObject(yamlText);
+      if (raw.name != null && typeof raw.name !== "string") {
+        setError("YAML name must be a quoted string.");
+        return;
+      }
+      if (raw.version != null && typeof raw.version !== "string") {
+        setError("YAML version must be a quoted string.");
+        return;
+      }
+      const kindValue = String(raw.kind ?? "") as ReleaseKind;
+      payload = {
+        name: (typeof raw.name === "string" ? raw.name : "").trim(),
+        version: (typeof raw.version === "string" ? raw.version : "").trim(),
+        kind: kindValue,
+        artifact_id: raw.artifact_id == null || raw.artifact_id === "" ? null : String(raw.artifact_id),
+        description:
+          raw.description == null || raw.description === ""
+            ? null
+            : String(raw.description),
+        spec:
+          raw.spec && typeof raw.spec === "object" && !Array.isArray(raw.spec)
+            ? (raw.spec as Record<string, unknown>)
+            : {},
+      };
+      if (!payload.name || !payload.version || !payload.kind) {
+        setError("YAML must include name, version, and kind.");
+        return;
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Invalid YAML.");
+      return;
+    }
+    setSaving(true);
+    try {
+      const release = await createRelease(token, organizationId, payload);
+      onCreated(release);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not create the release.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div
+        role="dialog"
+        aria-labelledby="create-release-title"
+        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg border border-border bg-card p-6 shadow-lg"
+      >
+        <h2 id="create-release-title" className="text-xl font-semibold">
+          Create release
+        </h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          A version of software you can deploy to devices later. Choose how it runs on the device;
+          more kinds (for example AI models) can be added without changing this flow.
+        </p>
+        <div className="mt-4 flex gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === "form" ? "default" : "outline"}
+            onClick={() => setMode("form")}
+          >
+            Form
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            variant={mode === "yaml" ? "default" : "outline"}
+            onClick={() => setMode("yaml")}
+          >
+            Advanced YAML
+          </Button>
+        </div>
+        {mode === "yaml" ? (
+          <form className="mt-4 space-y-4" onSubmit={(event) => void onSubmitYaml(event)}>
+            <div className="space-y-2">
+              <Label htmlFor="release-yaml">Release body (YAML)</Label>
+              <textarea
+                id="release-yaml"
+                className="min-h-[240px] w-full rounded-md border border-input bg-field px-3 py-2 font-mono text-sm"
+                value={yamlText}
+                onChange={(event) => setYamlText(event.target.value)}
+                spellCheck={false}
+              />
+            </div>
+            {error && <p className="text-sm text-destructive">{error}</p>}
+            <div className="flex justify-end gap-2 pt-2">
+              <Button type="button" variant="outline" onClick={onClose} disabled={saving}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={saving}>
+                {saving ? "Creating…" : "Create release"}
+              </Button>
+            </div>
+          </form>
+        ) : (
+        <form className="mt-4 space-y-4" onSubmit={onSubmit}>
+          <div className="space-y-2">
+            <Label htmlFor="release-kind">Deployment type</Label>
+            <select
+              id="release-kind"
+              className={SELECT_CLASS}
+              value={kind}
+              onChange={(event) => {
+                // Artifacts are filtered by kind, so a choice from another kind no longer fits.
+                setKind(event.target.value as ReleaseKind);
+                setArtifactId("");
+                setError(null);
+              }}
+            >
+              {RELEASE_KINDS.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-muted-foreground">{kindMeta.hint}</p>
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="release-name">Name</Label>
+            <Input
+              id="release-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="camera-agent"
+              required
+              maxLength={120}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="release-version">Version</Label>
+            <Input
+              id="release-version"
+              value={version}
+              onChange={(event) => setVersion(event.target.value)}
+              placeholder="1.2.0"
+              required
+              maxLength={64}
+            />
+          </div>
+
+          {(artifactRequired || kind === "docker") && (
+            <div className="space-y-2">
+              <Label htmlFor="release-artifact">
+                Artifact{kind === "docker" ? " (optional tarball)" : ""}
+              </Label>
+              <select
+                id="release-artifact"
+                className={SELECT_CLASS}
+                value={artifactId}
+                onChange={(event) => setArtifactId(event.target.value)}
+                required={artifactRequired}
+              >
+                <option value="">
+                  {kind === "docker" ? "None — pull image by name" : "Select an artifact…"}
+                </option>
+                {artifactOptions.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+              {artifactsQuery.isSuccess && artifacts.length === 0 && (
+                <p className="text-sm text-muted-foreground">
+                  {kind === "docker"
+                    ? "No docker tarball uploaded. You can still pull by image name below."
+                    : `Upload a matching artifact under Artifacts first (type: ${artifactType}).`}
+                </p>
+              )}
+            </div>
+          )}
+
+          {kind === "systemd" && (
+            <div className="space-y-2">
+              <Label htmlFor="release-unit">Unit name</Label>
+              <Input
+                id="release-unit"
+                value={unitName}
+                onChange={(event) => setUnitName(event.target.value)}
+                placeholder="camera-agent.service"
+                required
+                maxLength={255}
+              />
+            </div>
+          )}
+
+          {kind === "docker" && (
+            <>
+              <div className="space-y-2">
+                <Label htmlFor="release-container">Container name</Label>
+                <Input
+                  id="release-container"
+                  value={containerName}
+                  onChange={(event) => setContainerName(event.target.value)}
+                  placeholder="camera-agent"
+                  required
+                  maxLength={255}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="release-image">Image{artifactId ? " (optional)" : ""}</Label>
+                <Input
+                  id="release-image"
+                  value={image}
+                  onChange={(event) => setImage(event.target.value)}
+                  placeholder="ghcr.io/example/camera-agent:1.2.0"
+                  maxLength={512}
+                />
+              </div>
+            </>
+          )}
+
+          {kind === "docker_compose" && (
+            <div className="space-y-2">
+              <Label htmlFor="release-project">Application / project name</Label>
+              <Input
+                id="release-project"
+                value={projectName}
+                onChange={(event) => setProjectName(event.target.value)}
+                placeholder="camera-stack"
+                required
+                maxLength={255}
+              />
+              <p className="text-xs text-muted-foreground">
+                Used as the Docker Compose project name on the device.
+              </p>
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={healthGate}
+                onChange={(event) => setHealthGate(event.target.checked)}
+              />
+              Roll back automatically if the update is not healthy
+            </label>
+            {healthGate && (
+              <>
+                <Label htmlFor="release-health-url">Health URL on the device (optional)</Label>
+                <Input
+                  id="release-health-url"
+                  value={healthUrl}
+                  onChange={(event) => setHealthUrl(event.target.value)}
+                  placeholder="http://127.0.0.1:8080/health"
+                  maxLength={512}
+                />
+                <p className="text-xs text-muted-foreground">
+                  Each device waits up to 60 seconds for the new version to be healthy for 10 seconds in a
+                  row, and otherwise goes back to the version it ran before.
+                </p>
+              </>
+            )}
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="release-description">Description (optional)</Label>
+            <Input
+              id="release-description"
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              maxLength={2000}
+            />
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+          <div className="flex justify-end gap-2 pt-2">
+            <Button type="button" variant="outline" onClick={onClose} disabled={saving}>
+              Cancel
+            </Button>
+            <Button type="submit" disabled={!canSubmit}>
+              {saving ? "Creating…" : "Create release"}
+            </Button>
+          </div>
+        </form>
+        )}
+      </div>
+    </div>
+  );
+}

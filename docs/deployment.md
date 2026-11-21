@@ -1,0 +1,140 @@
+# Deployment with Docker Compose and Ansible
+
+**Production** on one Linux server: a VM, an EC2 instance, or an on-prem machine.
+For testing on a laptop use `make dev` ([Getting started](getting-started.md)), not
+this page. For Kubernetes clusters see [kubernetes.md](kubernetes.md).
+
+The stack is defined once, in [`deploy/compose/`](../deploy/compose/). Ansible
+prepares the server and runs those same files; it does not keep its own copy.
+
+## What runs
+
+| Service | When | Notes |
+| --- | --- | --- |
+| `traefik` | always (prod overlay) | Ports 80/443. Routes `/api` and `/health` to the API, the rest to the console. Let's Encrypt when `PLATFORM_DOMAIN` is set |
+| `backend` | always | API; runs database migrations on start |
+| `console` | always | Static SPA (nginx) |
+| `postgres` | profile `postgres` | Omit and set `DATABASE_URL` for an external database |
+| `redis` | profile `redis` | Only with `CACHE_PROVIDER=redis` |
+| `minio` | profile `minio` | Only with `OBJECT_STORAGE_PROVIDER=s3` and no other S3 service |
+| `data-plane` | profile `mqtt` | Needed whenever `MQTT_ENABLED=true` |
+| `data-api` | profile `data-api` | Application data API for the SDK (`/v1`). Ansible: `data_api_enabled: true` |
+| `mosquitto` | profile `mosquitto` | Bundled broker on 8883 (TLS), default. Use profile `emqx` or `vernemq` instead for that broker, or omit all three for an external one. [MQTT brokers](fleet/mqtt-brokers.md) |
+| Prometheus, node-exporter, Loki, Alloy, Alertmanager, Grafana | `docker-compose.observability.yml`, profiles `metrics`, `logs`, `alerting`, `dashboards` | Each optional, bound to 127.0.0.1; see [Observability](observability.md) |
+
+`/internal/*` (broker callbacks), data-api ops (`:8092`), and `/metrics` are never routed by Traefik. PathPrefix `/v1` reaches the data API when the `data-api` profile is on.
+
+## Configuration
+
+| Kind | Compose | Ansible |
+| --- | --- | --- |
+| Infrastructure choices | `COMPOSE_PROFILES`, `*_PROVIDER`, image names in `deploy/compose/.env` | `inventory/<name>/group_vars/platform.yml` |
+| Secrets | `deploy/compose/.env` (mode 0600, never committed) | `EDGE_PLATFORM_*` env vars on the controller or ansible-vault; rendered into the host's `.env` |
+| Application settings | `deploy/compose/.env` | `roles/meteorcloud/defaults/main.yml` |
+
+Every key is documented in [`deploy/compose/.env.example`](../deploy/compose/.env.example).
+
+### Storage options
+
+| `OBJECT_STORAGE_PROVIDER` | Settings |
+| --- | --- |
+| `filesystem` | `OBJECT_STORAGE_PATH` inside the API container (`ARTIFACTS_DATA` volume on the host) |
+| `s3`, AWS | `OBJECT_STORAGE_BUCKET`, `OBJECT_STORAGE_REGION`; keys optional with an instance role |
+| `s3`, S3-compatible / customer | also `OBJECT_STORAGE_ENDPOINT_URL` and keys |
+| `s3`, GCS | `OBJECT_STORAGE_ENDPOINT_URL=https://storage.googleapis.com` with HMAC keys (interoperability) |
+| `s3`, bundled MinIO | profile `minio`, endpoint `http://minio:9000` |
+
+Artifact downloads go through the API, so the storage endpoint never has to be public.
+
+## Option 1: Ansible (recommended for servers)
+
+Requirements: Ubuntu 22.04+, Debian 12+, or RHEL/CentOS/Rocky/AlmaLinux 9+, with
+sudo. The stack runs in Docker (same images on every distro). `make up` on the
+host installs Ansible if needed and uses it to install Docker and host packages
+for that OS. SSH-from-a-laptop and `make aws-up` need Ansible on the controller
+instead.
+
+### On this VM (on-prem or an existing server)
+
+Clone the repo **on the host** and run `make up`. It creates inventory and secrets,
+installs Ansible if needed, then Docker Compose production and WireGuard.
+
+```bash
+# Ubuntu / Debian:  sudo apt-get update && sudo apt-get install -y git make
+# RHEL / Rocky / Alma: sudo dnf install -y git make
+git clone https://github.com/meteor-edge/meteor-cloud.git
+cd meteor-cloud
+make up PLATFORM_DOMAIN=fleet.example.com
+```
+
+`PLATFORM_DOMAIN` is required (`export PLATFORM_DOMAIN=fleet.example.com` or
+`make up PLATFORM_DOMAIN=fleet.example.com`); the script exits if it is empty.
+Then a checkbox of optional services (WireGuard, MQTT, MinIO), **all on**:
+up/down to move, space to check, Enter to continue. WireGuard also enables
+browser SSH. It prints DNS records for that setup. `--storage=s3` or
+`--mqtt=external` still ask for bucket or broker settings. Open
+`https://fleet.example.com`, not the public IP. Full list: [DNS records](dns.md).
+
+| Command | What it does |
+| --- | --- |
+| `make up` | Install or upgrade on this host (WireGuard included) |
+| `make up ARGS=--no-vpn` | Same, without WireGuard |
+| `make down` | Stop; data stays in `/opt/edge-platform` |
+| `make down ARGS=--destroy-data` | Stop and delete `/opt/edge-platform` |
+
+Secrets are generated if missing, printed at the end so you can copy them, and
+saved mode `0600` at `~/.meteorcloud/secrets.env` and
+`deploy/ansible/inventory/selfhost/secrets.env` (gitignored). Optional:
+`PLATFORM_PUBLIC_URL=https://fleet.example.com make up`.
+
+To **create** a new AWS EC2 from a laptop, use `make aws-up` ([AWS deployment](aws-deployment.md)). Do not run `make aws-up` on the VM itself.
+
+### Another server (SSH from your laptop)
+
+```bash
+cd deploy/ansible
+cp -r inventory/example inventory/production
+$EDITOR inventory/production/hosts.yml inventory/production/group_vars/platform.yml
+export EDGE_PLATFORM_POSTGRES_PASSWORD="$(openssl rand -hex 16)"
+export EDGE_PLATFORM_JWT_SECRET="$(openssl rand -hex 32)"
+ansible-playbook -i inventory/production/hosts.yml playbooks/site.yml
+```
+
+`site.yml` installs Docker, optionally configures UFW, creates `/opt/edge-platform`,
+copies the Compose bundle, renders `.env`, starts the stack with
+`docker compose up --wait`, and checks `/health`. It is safe to re-run; an unchanged
+second run reports no changes. Details: [deploy/ansible/README.md](../deploy/ansible/README.md).
+
+Upgrade: change `git_ref` (git builds) or image tags (registry), then run
+`playbooks/upgrade.yml`. Destroy: `playbooks/destroy.yml` (add
+`-e platform_destroy_data=true` to delete data).
+
+On AWS from a laptop, `make aws-up` (`edge-installer`) creates the EC2 instance with Terraform and runs the same
+playbooks: [aws-deployment.md](aws-deployment.md). To check that a fresh instance
+still installs cleanly, run the manual **EC2 smoke test** workflow
+([aws-ci.md](aws-ci.md)).
+
+## Option 2: Docker Compose by hand
+
+```bash
+cd deploy/compose
+cp .env.example .env
+$EDITOR .env    # secrets, COMPOSE_PROFILES, providers, PLATFORM_DOMAIN, ACME_EMAIL
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --wait
+```
+
+Minimal production `.env` choices: `COMPOSE_PROFILES=postgres`,
+`OBJECT_STORAGE_PROVIDER=filesystem`, `CACHE_PROVIDER=memory`, `MQTT_ENABLED=false`.
+
+Verify any install: `python3 scripts/smoke_test.py https://fleet.example.com`.
+`make compose-smoke` starts exactly that minimal stack on ports 18080/18443, runs
+the smoke test, and removes it again.
+
+## Backups
+
+Installs from `make up` / Ansible back up PostgreSQL, ClickHouse and artifacts every
+night into `/opt/edge-platform/backups` (7 days kept, optional copy to S3). Run one now
+with `sudo systemctl start meteorcloud-backup`; restore with
+`sudo meteorcloud-restore --yes /opt/edge-platform/backups/<timestamp>` after loading
+the settings from `/opt/edge-platform/backup.env`. Details, settings and the Kubernetes
+CronJob: [Backups and restore](backups.md).

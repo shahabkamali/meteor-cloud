@@ -7,17 +7,28 @@ import { LoginPage } from "@/pages/auth/LoginPage";
 import { RegisterPage } from "@/pages/auth/RegisterPage";
 import { HealthPage } from "@/pages/HealthPage";
 import { LandingPage } from "@/pages/LandingPage";
+import { ArtifactsPage } from "@/pages/artifacts/ArtifactsPage";
+import { DeploymentDetailPage } from "@/pages/deployments/DeploymentDetailPage";
+import { DeploymentsPage } from "@/pages/deployments/DeploymentsPage";
+import { EndpointsPage } from "@/pages/endpoints/EndpointsPage";
+import { ReleasesPage } from "@/pages/releases/ReleasesPage";
 import { DeviceDetailPage } from "@/pages/fleet/DeviceDetailPage";
+import { DeviceGroupDetailPage } from "@/pages/fleet/DeviceGroupDetailPage";
 import { DeviceGroupsPage } from "@/pages/fleet/DeviceGroupsPage";
 import { DevicesPage } from "@/pages/fleet/DevicesPage";
+import { DeviceTypeDetailPage } from "@/pages/fleet/DeviceTypeDetailPage";
 import { DeviceTypesPage } from "@/pages/fleet/DeviceTypesPage";
 import { ApiKeysPage } from "@/pages/fleet/ApiKeysPage";
 import { MqttTestPage } from "@/pages/fleet/MqttTestPage";
 import { OrganizationCreatePage } from "@/pages/organizations/OrganizationCreatePage";
 import { OrganizationListPage } from "@/pages/organizations/OrganizationListPage";
+import { AuditLogPage } from "@/pages/organizations/AuditLogPage";
+import { MemberAccessPage } from "@/pages/organizations/MemberAccessPage";
 import { OrganizationMembersPage } from "@/pages/organizations/OrganizationMembersPage";
 import { OrganizationOverviewPage } from "@/pages/organizations/OrganizationOverviewPage";
 import { OrganizationSettingsPage } from "@/pages/organizations/OrganizationSettingsPage";
+import { TeamDetailPage } from "@/pages/organizations/TeamDetailPage";
+import { TeamsPage } from "@/pages/organizations/TeamsPage";
 
 export function App() {
   return (
@@ -63,6 +74,38 @@ export function App() {
           }
         />
         <Route
+          path="organizations/:organizationId/members/:membershipId/access"
+          element={
+            <ProtectedRoute>
+              <MemberAccessPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/audit-log"
+          element={
+            <ProtectedRoute>
+              <AuditLogPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/teams"
+          element={
+            <ProtectedRoute>
+              <TeamsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/teams/:teamId"
+          element={
+            <ProtectedRoute>
+              <TeamDetailPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
           path="organizations/:organizationId/settings"
           element={
             <ProtectedRoute>
@@ -99,6 +142,62 @@ export function App() {
           element={
             <ProtectedRoute>
               <DeviceGroupsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/device-groups/:groupId"
+          element={
+            <ProtectedRoute>
+              <DeviceGroupDetailPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/device-types/:typeId"
+          element={
+            <ProtectedRoute>
+              <DeviceTypeDetailPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/artifacts"
+          element={
+            <ProtectedRoute>
+              <ArtifactsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/releases"
+          element={
+            <ProtectedRoute>
+              <ReleasesPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/deployments"
+          element={
+            <ProtectedRoute>
+              <DeploymentsPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/deployments/:deploymentId"
+          element={
+            <ProtectedRoute>
+              <DeploymentDetailPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route
+          path="organizations/:organizationId/endpoints"
+          element={
+            <ProtectedRoute>
+              <EndpointsPage />
             </ProtectedRoute>
           }
         />

@@ -1,24 +1,27 @@
 # Installer configuration
 
-Single YAML file, typically `installation.yaml` at the repo root.
+Single YAML file, typically `installation.yaml` at the repo root. `edge-installer` uses it to create an AWS EC2 host (Terraform) and deploy the Docker Compose stack on it (Ansible).
 
 ## Sections
 
 | Section | Purpose |
 |---------|---------|
-| `installation` | Name, environment, provider (`aws` or `gcp`) |
+| `installation` | Name, environment, provider (`aws`), optional `demo` (Demo Organization) |
 | `platform` | App version, optional domain / public URL |
-| `aws` | Required for `provider: aws` — region, instance type, SSH key, Elastic IP |
-| `gcp` | Required for `provider: gcp` — project, region, Cloud Run/SQL sizing |
+| `aws` | Region, instance type, SSH key, Elastic IP, optional `dns_zone_id` (Route53) |
 | `network` | SSH CIDRs, HTTP/HTTPS exposure |
 | `services` | **Which stacks to deploy** (cloud_app, vpn, ...) |
-| `components` | In-app components when cloud_app is enabled (Postgres, Redis, Traefik) |
+| `components` | Bundled PostgreSQL (off = external via `EDGE_PLATFORM_DATABASE_URL`), Redis (off by default = in-memory rate limits), Traefik |
+| `observability` | Metrics, logs, alerting and dashboards on the host, each optional; retention ([Observability](observability.md#installer-installationyaml)) |
 | `deployment` | Git repo / container images, health timeout |
 | `secrets` | Must be `environment` — values from env vars |
 
 Full example: `infrastructure/installer/edge_installer/config/examples/installation.yaml`
 
 ## Services (modular deploy)
+
+`installation.demo: true` (and `make up` **Demo organization**) creates
+*Demo Organization* for the admin login. Enroll devices yourself with `meteorcli`.
 
 ```yaml
 services:
@@ -31,46 +34,60 @@ services:
     allowed_client_cidrs:
       - 0.0.0.0/0
     server_address: 10.8.0.1/24
+    placement: same_host        # or dedicated
+    # instance_type: t3.micro   # dedicated gateway only
+    # root_volume_size_gb: 16
 ```
 
 - Default: both enabled
-- `vpn` requires `cloud_app` (same EC2 host)
+- `vpn` requires `cloud_app` and `EDGE_PLATFORM_CONNECTIVITY_INTERNAL_TOKEN`
+  (shared by the API and the WireGuard gateway agent). The gateway's server key
+  is generated on the host unless `EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY` is set.
+- `vpn.placement`:
+  - `same_host` (default): WireGuard runs on the cloud_app EC2 instance.
+  - `dedicated`: Terraform creates a second EC2 instance with its own security
+    group (SSH, UDP `listen_port`) and Elastic IP. Ansible installs WireGuard
+    there and joins the API host to it with a WireGuard site link over the VPC.
+    Devices dial the gateway's Elastic IP; give it a DNS name such as
+    `wg.<domain>` (see [connectivity](fleet/connectivity.md)).
 - At least one service must be enabled
 
 When `cloud_app` is disabled, Postgres/JWT secrets are not required.
 
 See [Modular services](services.md).
 
-## GCP Cloud Run
+## Settings beyond this file
 
-Example: `installer/edge_installer/config/examples/installation.gcp.yaml`
-
-```yaml
-installation:
-  provider: gcp
-
-gcp:
-  project_id: your-gcp-project
-  region: europe-west1
-```
-
-`services.vpn` must be disabled. Images must already be in a registry Cloud Run can pull. Secrets stay in `EDGE_PLATFORM_*` env vars.
-
-See [GCP Cloud Run deployment](gcp-deployment.md).
+Storage, MQTT, firewall, and other Compose options are Ansible settings
+(`deploy/ansible/roles/meteorcloud/defaults/main.yml`). The installer deploys
+with their defaults: filesystem artifact storage and MQTT off. To change them,
+run the playbooks with your own inventory; see [Deployment](deployment.md).
 
 ## AWS settings
 
 ```yaml
 aws:
   region: eu-central-1
-  instance_type: t3.small
+  instance_type: auto   # or pin t3.medium; a type below the floor is raised
   architecture: amd64
   ssh_key_name: edge-platform
   ssh_private_key_path: ~/.ssh/edge-platform.pem
-  root_volume_size_gb: 30
+  root_volume_size_gb: 30   # raised if the workload needs more (git build, observability)
   assign_elastic_ip: true
+  dns_zone_id: ""   # Route53 zone id; with platform.domain, apply creates the A records
   profile: null   # optional AWS profile name
 ```
+
+`make aws-up` sizes the host from the containers that will run:
+
+| Workload | Typical type | Disk |
+| --- | --- | --- |
+| API + console + Postgres + Traefik, registry images | `t3.small` | 30 GiB |
+| Same, `image_source: git` (build on the box) | `t3.medium` | 40 GiB |
+| + observability (all components) | `t3.large` | 50 GiB |
+
+Observability is sized per enabled component (`observability.components`): metrics alone usually fits a `t3.medium`. The disk grows with `metrics_retention_size` and, for logs, about 5 GiB per 7 days of `log_retention_hours`.
+`arm64` uses `t4g.*`. A larger explicit type is kept. Changing type on an existing install replaces the instance (Elastic IP stays).
 
 ## Network
 
@@ -86,7 +103,7 @@ network:
 
 ```yaml
 deployment:
-  repository_url: https://github.com/shahabkamali/MeteorCloud.git
+  repository_url: https://github.com/meteor-edge/meteor-cloud.git
   git_ref: master
   image_source: git
   backend_image: edge-platform-backend:0.2.0
@@ -119,7 +136,10 @@ export EDGE_PLATFORM_ADMIN_EMAIL='admin@example.com'
 export EDGE_PLATFORM_ADMIN_PASSWORD='...'
 export EDGE_PLATFORM_ACME_EMAIL='ops@example.com'      # HTTPS + domain
 export EDGE_PLATFORM_VPN_SERVER_PRIVATE_KEY='...'    # activate WireGuard
-export EDGE_PLATFORM_REDIS_PASSWORD='...'
+export EDGE_PLATFORM_DATABASE_URL='postgresql+psycopg://...'   # components.postgres.enabled: false
+export EDGE_PLATFORM_GRAFANA_ADMIN_PASSWORD='...'    # observability.components.dashboards
+export EDGE_PLATFORM_ALERT_WEBHOOK_URL='https://...' # observability.components.alerting delivery
+export EDGE_PLATFORM_ALERT_HEARTBEAT_URL='https://...' # optional dead-man's-switch for the Watchdog alert (needs the webhook)
 ```
 
 Never put secrets in `installation.yaml` or commit them.
@@ -134,15 +154,18 @@ Never put secrets in `installation.yaml` or commit them.
 └── terraform/
 ```
 
-Gitignored. Do not commit.
+Gitignored. Do not commit. `extra-vars.json` (mode 0600) holds only non-secret
+settings. Secrets (`EDGE_PLATFORM_*` passwords, tokens, the alert webhook URL)
+are written to `secret-vars.json` for the duration of a playbook run and deleted
+afterwards. A manual `ansible-playbook` run reads them from the environment.
 
 ## Commands
 
 ```bash
 edge-installer validate installation.yaml
-make up      # apply
+make aws-up      # apply
 make plan
-make down    # destroy
+make aws-down    # destroy
 ```
 
 See [Install quickstart](install-quickstart.md).

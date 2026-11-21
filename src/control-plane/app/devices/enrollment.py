@@ -12,19 +12,24 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.audit.service import AuditRecorder
 from app.core.config import Settings, get_settings
-from app.core.exceptions import ConflictError, UnauthorizedError
+from app.core.exceptions import AppError, ConflictError, UnauthorizedError
+from app.core.metrics import ENROLLMENT_POLLS, ENROLLMENT_REQUESTS
 from app.devices.identity import DeviceIdentity, match_existing_device
 from app.devices.models import (
     Device,
     DeviceEnrollmentRequest,
     EnrollmentApiKey,
 )
+from app.devices.naming import default_device_name, device_type_slug_for, unique_device_name
 from app.devices.repository import (
     DeviceEnrollmentRequestRepository,
     DeviceRepository,
+    DeviceTypeRepository,
     EnrollmentApiKeyRepository,
 )
 from app.devices.schemas import (
@@ -55,10 +60,13 @@ class EnrollmentService:
         payload: AgentEnrollRequest,
     ) -> AgentEnrollResponse:
         try:
-            return self._submit_request(api_key, payload)
+            response = self._submit_request(api_key, payload)
         except Exception:
             self.session.rollback()
+            ENROLLMENT_REQUESTS.labels(result="error").inc()
             raise
+        ENROLLMENT_REQUESTS.labels(result="submitted").inc()
+        return response
 
     def _submit_request(
         self,
@@ -73,29 +81,79 @@ class EnrollmentService:
         now = datetime.now(UTC)
         ttl = self.settings.enrollment_request_ttl_seconds
         expires_at = now + timedelta(seconds=ttl) if ttl > 0 else None
+        requested_name = payload.name.strip()[:255] if payload.name else None
 
-        request = DeviceEnrollmentRequest(
-            organization_id=api_key.organization_id,
-            api_key_id=api_key.id,
-            status="pending",
-            claim_secret_hash=claim.token_hash,
-            claim_secret_prefix=claim.display_prefix,
-            requested_name=(payload.name.strip()[:255] if payload.name else None),
-            serial_number=identity.serial_number,
-            mac_addresses=identity.mac_addresses,
-            hostname=payload.hostname,
-            os_name=payload.os_name,
-            os_version=payload.os_version,
-            kernel_version=payload.kernel_version,
-            architecture=payload.architecture,
-            cpu_model=payload.cpu_model,
-            cpu_cores=payload.cpu_cores,
-            memory_mb=payload.memory_mb,
-            labels=payload.labels or {},
-            metadata_=payload.metadata or {},
-            expires_at=expires_at,
-        )
-        self.requests.create(request)
+        primary_macs = [identity.primary_mac] if identity.primary_mac else []
+
+        # Serializes submissions per organization: one device must not get two rows,
+        # and concurrent submissions must not all pass the pending cap.
+        self.session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(str(api_key.organization_id), 0))))
+        existing = None if identity.is_empty else self._find_reusable_request(api_key, identity)
+        if existing is not None:
+            if existing.status == "pending" and not self._counted_for_key(existing, api_key, now):
+                # Moving another key's request, or reviving an expired one, takes a new slot.
+                self._enforce_pending_cap(api_key, now)
+            request = existing
+            request.api_key_id = api_key.id
+            request.claim_secret_hash = claim.token_hash
+            request.claim_secret_prefix = claim.display_prefix
+            request.requested_name = requested_name
+            request.serial_number = identity.serial_number
+            request.mac_addresses = primary_macs
+            request.hostname = payload.hostname
+            request.os_name = payload.os_name
+            request.os_version = payload.os_version
+            request.kernel_version = payload.kernel_version
+            request.architecture = payload.architecture
+            request.hardware_model = payload.hardware_model
+            request.cpu_model = payload.cpu_model
+            request.cpu_cores = payload.cpu_cores
+            request.memory_mb = payload.memory_mb
+            request.local_ip = payload.local_ip
+            request.labels = payload.labels or {}
+            request.metadata_ = payload.metadata or {}
+            request.expires_at = expires_at
+            self.requests.update(request)
+        else:
+            self._enforce_pending_cap(api_key, now)
+            request = DeviceEnrollmentRequest(
+                organization_id=api_key.organization_id,
+                api_key_id=api_key.id,
+                status="pending",
+                claim_secret_hash=claim.token_hash,
+                claim_secret_prefix=claim.display_prefix,
+                requested_name=requested_name,
+                serial_number=identity.serial_number,
+                mac_addresses=primary_macs,
+                hostname=payload.hostname,
+                os_name=payload.os_name,
+                os_version=payload.os_version,
+                kernel_version=payload.kernel_version,
+                architecture=payload.architecture,
+                hardware_model=payload.hardware_model,
+                cpu_model=payload.cpu_model,
+                cpu_cores=payload.cpu_cores,
+                memory_mb=payload.memory_mb,
+                local_ip=payload.local_ip,
+                labels=payload.labels or {},
+                metadata_=payload.metadata or {},
+                expires_at=expires_at,
+            )
+            self.requests.create(request)
+            # Retries update the same row and are not audited again; a new row is.
+            AuditRecorder(self.session).record(
+                organization_id=api_key.organization_id,
+                action="enrollment_request.submit",
+                resource_type="enrollment_request",
+                resource_id=request.id,
+                actor_type="enrollment_key",
+                actor_id=api_key.id,
+                metadata={
+                    "key_prefix": api_key.key_prefix,
+                    "hostname": (payload.hostname or "")[:255] or None,
+                    "serial_number": identity.serial_number,
+                },
+            )
 
         api_key.last_used_at = now
         self.api_keys.update(api_key)
@@ -105,10 +163,55 @@ class EnrollmentService:
         return AgentEnrollResponse(
             request_id=request.id,
             claim_secret=claim.plaintext,
-            status="pending",
+            status=request.status,
             poll_interval_seconds=self.settings.enrollment_poll_interval_seconds,
             expires_at=request.expires_at,
         )
+
+    def _enforce_pending_cap(self, api_key: EnrollmentApiKey, now: datetime) -> None:
+        """Refuse a new pending request once the key has too many waiting for an answer.
+
+        Updates of a device's existing request are not counted against the cap, so a
+        device that retries never locks itself out.
+        """
+        cap = self.settings.enrollment_max_pending_per_key
+        if cap <= 0:
+            return
+        if self.requests.count_pending_for_key(api_key_id=api_key.id, now=now) >= cap:
+            raise AppError(
+                "too_many_pending_requests",
+                "This enrollment key has too many requests waiting for approval. "
+                "Approve or reject some in the console, then try again.",
+                status_code=429,
+                headers={"Retry-After": "300"},
+            )
+
+    @staticmethod
+    def _counted_for_key(request: DeviceEnrollmentRequest, api_key: EnrollmentApiKey, now: datetime) -> bool:
+        """Whether the pending cap already counts this row for the key (see count_pending_for_key)."""
+        expires_at = request.expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return request.api_key_id == api_key.id and (expires_at is None or expires_at > now)
+
+    def _find_reusable_request(
+        self,
+        api_key: EnrollmentApiKey,
+        identity: DeviceIdentity,
+    ) -> DeviceEnrollmentRequest | None:
+        """The unclaimed request this submission may update and rotate the secret of.
+
+        A pending row still goes to an administrator, who sees the latest key and
+        inventory. An approved row is one poll away from a device credential, so only
+        the key and hardware that were approved may reuse it; anything else starts a
+        new pending request.
+        """
+        for row in self.requests.list_active_unclaimed(organization_id=api_key.organization_id):
+            if not identity.matches_request(row):
+                continue
+            if row.status == "pending" or (row.api_key_id == api_key.id and identity.same_hardware_as_request(row)):
+                return row
+        return None
 
     def check(self, *, api_key: EnrollmentApiKey) -> AgentEnrollCheckResponse:
         organization = self.session.get(Organization, api_key.organization_id)
@@ -128,10 +231,13 @@ class EnrollmentService:
     # -------------------------------------------------------------- poll
     def poll(self, payload: AgentEnrollPollRequest) -> AgentEnrollPollResponse:
         try:
-            return self._poll(payload)
-        except Exception:
+            response = self._poll(payload)
+        except Exception as exc:
             self.session.rollback()
+            ENROLLMENT_POLLS.labels(status="unauthorized" if isinstance(exc, UnauthorizedError) else "error").inc()
             raise
+        ENROLLMENT_POLLS.labels(status=response.status).inc()
+        return response
 
     def _poll(self, payload: AgentEnrollPollRequest) -> AgentEnrollPollResponse:
         request = self.requests.get_by_id(payload.request_id)
@@ -174,6 +280,15 @@ class EnrollmentService:
         request.claimed_at = now
         request.device_id = device.id
         self.requests.update(request)
+        AuditRecorder(self.session).record(
+            organization_id=device.organization_id,
+            action="enrollment_request.claim",
+            resource_type="device",
+            resource_id=device.id,
+            actor_type="enrollment_request",
+            actor_id=request.id,
+            metadata={"name": device.name, "enrollment_request_id": str(request.id)},
+        )
         self.session.commit()
         self.session.refresh(device)
         return AgentEnrollPollResponse(
@@ -229,16 +344,24 @@ class EnrollmentService:
         return device, generated.plaintext
 
     def _resolve_name(self, request: DeviceEnrollmentRequest, identity: DeviceIdentity) -> str:
-        candidate = (
-            request.assigned_name
-            or request.requested_name
-            or request.hostname
-            or identity.serial_number
-            or (identity.mac_addresses[0] if identity.mac_addresses else None)
+        if request.assigned_name:
+            return request.assigned_name.strip()[:255]
+        self.devices.lock_names(organization_id=request.organization_id)
+        return unique_device_name(
+            default_device_name(
+                requested_name=request.requested_name,
+                hostname=request.hostname,
+                serial_number=identity.serial_number,
+                mac_addresses=identity.mac_addresses,
+                device_type_slug=device_type_slug_for(
+                    request.device_type_id,
+                    request.hardware_model,
+                    DeviceTypeRepository(self.session).list(organization_id=request.organization_id),
+                ),
+                hardware_model=request.hardware_model,
+            ),
+            taken=self.devices.taken_names(organization_id=request.organization_id),
         )
-        if candidate:
-            return candidate.strip()[:255]
-        return "unnamed-device"
 
     def _apply_inventory(self, device: Device, request: DeviceEnrollmentRequest, identity: DeviceIdentity) -> None:
         device.serial_number = identity.serial_number
@@ -248,9 +371,11 @@ class EnrollmentService:
         device.os_version = request.os_version
         device.kernel_version = request.kernel_version
         device.architecture = request.architecture
+        device.hardware_model = request.hardware_model
         device.cpu_model = request.cpu_model
         device.cpu_cores = request.cpu_cores
         device.memory_mb = request.memory_mb
+        device.local_ip = request.local_ip
         if request.labels:
             device.labels = request.labels
         if request.metadata_:
@@ -298,5 +423,7 @@ class EnrollmentService:
         device.credential_prefix = generated.display_prefix
         device.last_seen_at = now
         device.registered_at = now
-        device.is_enabled = True
+        # An administrator approved this hardware, which also closes any re-registration window.
+        # A disabled device stays disabled: enabling it is a separate, explicit action.
+        device.reregistration_allowed_until = None
         return self.devices.update(device)

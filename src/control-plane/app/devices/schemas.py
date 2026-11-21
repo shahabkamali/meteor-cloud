@@ -2,14 +2,40 @@
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from app.devices.status import ConnectivityStatus
 from app.mqtt.schemas import MqttConnectInfo
+from app.tenancy.schemas import validate_slug
+
+
+def _optional_ip(value: object) -> str | None:
+    """Return a canonical IP, or None when the value is blank or not an address.
+
+    A bad value must not fail the heartbeat: the rest of the report still counts.
+    BeforeValidator runs before the field type is checked, so a non-string
+    (for example a JSON number) is discarded here instead of raising.
+    """
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    try:
+        address = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return None
+    if address.is_unspecified or address.is_loopback or address.is_link_local or address.is_multicast:
+        return None
+    return str(address)
+
+
+LocalIp = Annotated[str | None, BeforeValidator(_optional_ip)]
 
 
 def _strip_optional(value: str | None) -> str | None:
@@ -19,47 +45,76 @@ def _strip_optional(value: str | None) -> str | None:
     return cleaned or None
 
 
+def _validate_optional_slug(value: str | None) -> str | None:
+    """Preserve None; otherwise trim/lowercase the slug and validate its format.
+
+    Raise ValueError unless it contains ASCII letters/digits separated by
+    single hyphens and is at most 100 characters after normalization.
+    """
+    if value is None:
+        return None
+    return validate_slug(value)
+
+
+def _strip_name_value(value: str | None) -> str | None:
+    """Preserve None or trim the name, raising ValueError for blank text."""
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        raise ValueError("Name must not be blank")
+    return cleaned
+
+
 # --------------------------------------------------------------------------- #
 # Device types
 # --------------------------------------------------------------------------- #
-class DeviceTypeCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+class _DeviceTypeFields(BaseModel):
+    slug: str | None = Field(default=None, max_length=100)
     description: str | None = Field(default=None, max_length=2000)
+    manufacturer: str | None = Field(default=None, max_length=120)
+    model: str | None = Field(default=None, max_length=120)
+    architecture: str | None = Field(default=None, max_length=64)
+
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, value: str | None) -> str | None:
+        """Normalize an optional slug, raising ValueError for invalid format or length."""
+        return _validate_optional_slug(value)
+
+    @field_validator("description", "manufacturer", "model", "architecture")
+    @classmethod
+    def _strip_text(cls, value: str | None) -> str | None:
+        """Trim optional catalog text, returning None for missing or blank values."""
+        return _strip_optional(value)
+
+
+class DeviceTypeCreateRequest(_DeviceTypeFields):
+    """``slug`` is derived from ``name`` when omitted."""
+
+    name: str = Field(min_length=1, max_length=120)
     capabilities: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod
     def _strip_name(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Name must not be blank")
-        return cleaned
-
-    @field_validator("description")
-    @classmethod
-    def _strip_description(cls, value: str | None) -> str | None:
-        return _strip_optional(value)
+        """Trim the name and raise ValueError if it is blank."""
+        return _strip_name_value(value)  # type: ignore[return-value]
 
 
-class DeviceTypeUpdateRequest(BaseModel):
+class DeviceTypeUpdateRequest(_DeviceTypeFields):
+    """Only fields present in the request are changed; text fields accept null to clear."""
+
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    description: str | None = Field(default=None, max_length=2000)
     capabilities: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
 
     @field_validator("name")
     @classmethod
     def _strip_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Name must not be blank")
-        return cleaned
-
-    @field_validator("description")
-    @classmethod
-    def _strip_description(cls, value: str | None) -> str | None:
-        return _strip_optional(value)
+        """Preserve None or trim the name, raising ValueError for blank text."""
+        return _strip_name_value(value)
 
 
 class DeviceTypeResponse(BaseModel):
@@ -68,8 +123,15 @@ class DeviceTypeResponse(BaseModel):
     id: uuid.UUID
     organization_id: uuid.UUID
     name: str
+    slug: str
     description: str | None
+    manufacturer: str | None
+    model: str | None
+    architecture: str | None
     capabilities: dict[str, Any]
+    metadata: dict[str, Any] = Field(validation_alias="metadata_")
+    device_count: int = 0
+    artifact_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -77,44 +139,48 @@ class DeviceTypeResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 # Device groups
 # --------------------------------------------------------------------------- #
-class DeviceGroupCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
+class _DeviceGroupFields(BaseModel):
+    slug: str | None = Field(default=None, max_length=100)
     description: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, value: str | None) -> str | None:
+        """Normalize an optional slug, raising ValueError for invalid format or length."""
+        return _validate_optional_slug(value)
+
+    @field_validator("description")
+    @classmethod
+    def _strip_description(cls, value: str | None) -> str | None:
+        return _strip_optional(value)
+
+
+class DeviceGroupCreateRequest(_DeviceGroupFields):
+    """``slug`` is derived from ``name`` when omitted."""
+
+    name: str = Field(min_length=1, max_length=120)
     labels: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod
     def _strip_name(cls, value: str) -> str:
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Name must not be blank")
-        return cleaned
-
-    @field_validator("description")
-    @classmethod
-    def _strip_description(cls, value: str | None) -> str | None:
-        return _strip_optional(value)
+        """Trim the name and raise ValueError if it is blank."""
+        return _strip_name_value(value)  # type: ignore[return-value]
 
 
-class DeviceGroupUpdateRequest(BaseModel):
+class DeviceGroupUpdateRequest(_DeviceGroupFields):
+    """Only fields present in the request are changed; description accepts null to clear."""
+
     name: str | None = Field(default=None, min_length=1, max_length=120)
-    description: str | None = Field(default=None, max_length=2000)
     labels: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
 
     @field_validator("name")
     @classmethod
     def _strip_name(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        cleaned = value.strip()
-        if not cleaned:
-            raise ValueError("Name must not be blank")
-        return cleaned
-
-    @field_validator("description")
-    @classmethod
-    def _strip_description(cls, value: str | None) -> str | None:
-        return _strip_optional(value)
+        """Preserve None or trim the name, raising ValueError for blank text."""
+        return _strip_name_value(value)
 
 
 class DeviceGroupResponse(BaseModel):
@@ -123,8 +189,11 @@ class DeviceGroupResponse(BaseModel):
     id: uuid.UUID
     organization_id: uuid.UUID
     name: str
+    slug: str
     description: str | None
     labels: dict[str, Any]
+    metadata: dict[str, Any] = Field(validation_alias="metadata_")
+    device_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -194,14 +263,18 @@ class DeviceResponse(BaseModel):
     os_version: str | None
     kernel_version: str | None
     architecture: str | None
+    hardware_model: str | None = None
     cpu_model: str | None
     cpu_cores: int | None
     memory_mb: int | None
+    local_ip: str | None = None
+    agent_version: str | None = None
     labels: dict[str, Any]
     metadata: dict[str, Any]
     credential_prefix: str | None
     last_seen_at: datetime | None
     registered_at: datetime | None
+    reregistration_allowed_until: datetime | None = None
     created_at: datetime
     updated_at: datetime
     mqtt_configured: bool = False
@@ -258,6 +331,9 @@ class DeviceCredentialResponse(BaseModel):
 # --------------------------------------------------------------------------- #
 class AgentRegisterRequest(BaseModel):
     token: str = Field(min_length=1)
+    # The device's current credential, when it has one. Re-registering hardware that is
+    # already a device needs it, unless an administrator allowed re-registration.
+    device_token: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=255)
     serial_number: str | None = Field(default=None, max_length=255)
     mac_addresses: list[str] = Field(default_factory=list)
@@ -266,9 +342,12 @@ class AgentRegisterRequest(BaseModel):
     os_version: str | None = Field(default=None, max_length=255)
     kernel_version: str | None = Field(default=None, max_length=255)
     architecture: str | None = Field(default=None, max_length=64)
+    hardware_model: str | None = Field(default=None, max_length=255)
     cpu_model: str | None = Field(default=None, max_length=255)
     cpu_cores: int | None = Field(default=None, ge=0)
     memory_mb: int | None = Field(default=None, ge=0)
+    local_ip: LocalIp = Field(default=None, max_length=64)
+    agent_version: str | None = Field(default=None, max_length=32)
     labels: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -284,9 +363,23 @@ class AgentRegisterResponse(BaseModel):
 
 class AgentHeartbeatRequest(BaseModel):
     hostname: str | None = Field(default=None, max_length=255)
+    os_name: str | None = Field(default=None, max_length=255)
     os_version: str | None = Field(default=None, max_length=255)
     kernel_version: str | None = Field(default=None, max_length=255)
+    architecture: str | None = Field(default=None, max_length=64)
+    serial_number: str | None = Field(default=None, max_length=255)
+    mac_addresses: list[str] = Field(default_factory=list)
+    hardware_model: str | None = Field(default=None, max_length=255)
+    cpu_model: str | None = Field(default=None, max_length=255)
+    cpu_cores: int | None = Field(default=None, ge=0)
+    memory_mb: int | None = Field(default=None, ge=0)
+    local_ip: LocalIp = Field(default=None, max_length=64)
+    agent_version: str | None = Field(default=None, max_length=32)
     metrics: dict[str, Any] = Field(default_factory=dict)
+    # Agent-reported install capabilities (systemd, docker, docker_compose, …).
+    capabilities: dict[str, Any] = Field(default_factory=dict)
+    # Installed / sync status for known workloads; unknown keys are ignored.
+    software_report: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentHeartbeatResponse(BaseModel):
@@ -294,6 +387,11 @@ class AgentHeartbeatResponse(BaseModel):
     status: ConnectivityStatus
     heartbeat_interval_seconds: int
     server_time: datetime
+    desired_software: list[dict[str, Any]] = Field(default_factory=list)
+    # Wi-Fi changes are waiting: collect them from GET /api/v1/agent/network/wifi.
+    wifi_pending: bool = False
+    # Restart, shut-down or SSH-user actions are waiting: collect from GET /api/v1/agent/actions.
+    actions_pending: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +448,12 @@ class DeviceEnrollmentRequestResponse(BaseModel):
     claim_secret_prefix: str
     requested_name: str | None
     assigned_name: str | None
+    # What the device will be called unless an administrator picks a name (list responses, unclaimed requests).
+    suggested_name: str | None = None
+    # Set when the suggestion is ``<kind>-<name_suffix>``: the kind follows the device type picked at approval.
+    name_suffix: str | None = None
+    # Catalog device type that fits the reported board model (pending requests without a type).
+    suggested_device_type_id: uuid.UUID | None = None
     device_type_id: uuid.UUID | None
     device_group_id: uuid.UUID | None
     serial_number: str | None
@@ -359,6 +463,7 @@ class DeviceEnrollmentRequestResponse(BaseModel):
     os_version: str | None
     kernel_version: str | None
     architecture: str | None
+    hardware_model: str | None = None
     cpu_model: str | None
     cpu_cores: int | None
     memory_mb: int | None
@@ -367,6 +472,9 @@ class DeviceEnrollmentRequestResponse(BaseModel):
     rejection_reason: str | None
     claimed_at: datetime | None
     device_id: uuid.UUID | None
+    enrollment_key_id: uuid.UUID | None = None
+    enrollment_key_name: str | None = None
+    enrollment_key_prefix: str | None = None
     expires_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -404,9 +512,11 @@ class AgentEnrollRequest(BaseModel):
     os_version: str | None = Field(default=None, max_length=255)
     kernel_version: str | None = Field(default=None, max_length=255)
     architecture: str | None = Field(default=None, max_length=64)
+    hardware_model: str | None = Field(default=None, max_length=255)
     cpu_model: str | None = Field(default=None, max_length=255)
     cpu_cores: int | None = Field(default=None, ge=0)
     memory_mb: int | None = Field(default=None, ge=0)
+    local_ip: LocalIp = Field(default=None, max_length=64)
     labels: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
